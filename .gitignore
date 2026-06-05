@@ -1,0 +1,33 @@
+# Личные конфиги с паролями/токенами — никогда не коммитить
+personal_config.py
+personal_config2.py
+*.env
+.env.*
+
+# Архив — локальные/старые скрипты
+archive/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Локальные базы данных
+*.db
+*.sqlite
+*.sqlite3
+
+# Временные файлы
+*.tmp
+*.log
+*.bak
+
+# IDE
+.vscode/
+.idea/
+*.swp
