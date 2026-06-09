@@ -36,6 +36,7 @@ CH_DATABASE_SOURCE = cfg.CH_DATABASE
 
 # === Настройки синхронизации (плавающие даты) ===
 DAYS_TO_SYNC = 20
+CHUNK_SIZE = 2000
 
 # === Настройки VPN ===
 VPN_APP_PATH = cfg.VPN_APP_PATH
@@ -473,10 +474,14 @@ WHERE
                 processed_row.append(processed_value)
             processed_rows.append(processed_row)
         
-        print(f"📤 Загружаю {len(processed_rows)} строк в {CH_DATABASE_TARGET}.{table_name}...")
-        client_target.insert(table_name, processed_rows, column_names=processed_column_names)
-        
-        success_msg = f"✅ Синхронизировано {len(processed_rows)} строк."
+        total = len(processed_rows)
+        print(f"📤 Загружаю {total} строк в {CH_DATABASE_TARGET}.{table_name} (батчи по {CHUNK_SIZE})...")
+        for i in range(0, total, CHUNK_SIZE):
+            chunk = processed_rows[i:i + CHUNK_SIZE]
+            client_target.insert(table_name, chunk, column_names=processed_column_names)
+            print(f"   Загружено {min(i + CHUNK_SIZE, total)}/{total} строк.")
+
+        success_msg = f"✅ Синхронизировано {total} строк."
         print(success_msg)
         send_ntfy_alert(success_msg, title="Cometa New Sync Success", priority="high", tags="white_check_mark")
         
