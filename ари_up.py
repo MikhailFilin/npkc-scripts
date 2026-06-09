@@ -272,7 +272,9 @@ def export_cometa_conclusions_summary():
         delete_query = f"ALTER TABLE {table_name} DELETE WHERE toDate(assignment_result_doc_created_date) >= '{start_date_del}'"
         client_target.command(delete_query)
         print(f"✅ Данные за последние {DAYS_TO_SYNC} дней удалены из {table_name}.")
-        
+        client_target.close()
+        client_target = None
+
     except Exception as e:
         error_msg = f"❌ Ошибка при создании или очистке таблицы: {e}"
         print(error_msg)
@@ -412,6 +414,29 @@ WHERE
         send_ntfy_alert(f"⚠️ Ошибка отключения VPN: {e}", title="VPN Warning", priority="default", tags="warning")
     
     # --- Шаг 6: Вставка в целевую базу ---
+    client_target = None
+    for attempt in range(1, 4):
+        try:
+            print(f"🔌 Подключаюсь к целевой базе для вставки (попытка {attempt})...")
+            client_target = clickhouse_connect.get_client(
+                host=CH_HOST_TARGET, port=CH_PORT_TARGET,
+                username=CH_USER_TARGET, password=CH_PASSWORD_TARGET,
+                database=CH_DATABASE_TARGET, secure=True, verify=False,
+                send_receive_timeout=600, connect_timeout=30,
+            )
+            break
+        except Exception as e:
+            print(f"   Попытка {attempt}: {e}")
+            if attempt < 3:
+                time.sleep(5)
+            else:
+                send_ntfy_alert(f"Ошибка подключения к target CH: {str(e)[:60]}",
+                                title="Cometa New Connect Error", priority="urgent", tags="database")
+                if os.path.exists(temp_db_name):
+                    try: os.remove(temp_db_name)
+                    except Exception: pass
+                return False
+
     try:
         print(f"📤 Загружаю данные из SQLite в целевую ClickHouse...")
         sqlite_conn = sqlite3.connect(temp_db_name)
