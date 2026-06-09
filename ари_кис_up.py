@@ -22,7 +22,7 @@ from ntfy_notifier import send_ntfy_alert
 import personal_config2 as cfg
 
 # === Настройки синхронизации (плавающие даты) ===
-DAYS_TO_SYNC = 2
+DAYS_TO_SYNC = 6
 
 # === Настройки исходной ClickHouse ===
 CH_HOST_SOURCE     = cfg.CH_HOST
@@ -282,6 +282,8 @@ WHERE
     AND i.emias_id IS NOT NULL
     AND sd.medical_employee_id IS NOT NULL
     AND e.naz_code IS NOT NULL
+    AND d.description IS NOT NULL AND d.description != ''
+    AND d.conclusion  IS NOT NULL AND d.conclusion  != ''
 
 ORDER BY i.sign_dt DESC NULLS LAST
 """

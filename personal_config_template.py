@@ -80,3 +80,10 @@ BITRIX_WEBHOOK = "https://your-portal.bitrix24.ru/rest/USER_ID/your_webhook_toke
 NTFY_SERVER      = "https://ntfy.sh"
 NTFY_TOPIC       = "your_unique_topic_name"
 NTFY_TOPIC_FINAL = "your_unique_final_topic_name"
+
+# --- IT Support Dashboard (it_support_dashboard_up.py) ---
+# OAuth-токен и Org ID создаются в Яндекс.Трекере: Профиль → Токены API
+TRACKER_TOKEN  = 'y0_your_yandex_tracker_oauth_token'
+TRACKER_ORG_ID = 'your_org_id'
+PG_USER_ITSUPPORT     = 'your_pg_username'
+PG_PASSWORD_ITSUPPORT = 'your_pg_password'

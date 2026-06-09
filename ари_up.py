@@ -329,6 +329,8 @@ WHERE
     AND a.assignment_result_doc_created_date >= toDate('{start_date_str}')
     AND a.assignment_result_doc_created_date <= toDate('{end_date_str}')
     AND r.descr_result_doctor_job_name != 'ERISPUM'
+    AND r.descr_result_description IS NOT NULL AND r.descr_result_description != ''
+    AND r.descr_result_conclusion  IS NOT NULL AND r.descr_result_conclusion  != ''
         """
         
         print("📥 Выполняю запрос к исходной ClickHouse...")
