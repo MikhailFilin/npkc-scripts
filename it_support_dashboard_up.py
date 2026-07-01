@@ -71,6 +71,8 @@ PG_CONN_PARAMS = {
     'dbname': cfg.PG_DATABASE,
     'user': cfg.PG_USER_ITSUPPORT,
     'password': cfg.PG_PASSWORD_ITSUPPORT,
+    'connect_timeout': 10,
+    'options': '-c statement_timeout=60000',
 }
 TABLE_NAME = '"it_support"."it_database"'
 CSV_FILE   = f'{QUEUE_KEY}_issues_{TARGET_YEAR}_filtered.csv'
@@ -202,8 +204,13 @@ def load_csv_to_postgres() -> None:
     conn = None
     cursor = None
     try:
+        logger.info(f"Читаю CSV {CSV_FILE}...")
         df = pd.read_csv(CSV_FILE, encoding='utf-8-sig')
+        logger.info(f"CSV прочитан: {len(df)} строк. Подключаюсь к PostgreSQL ({cfg.PG_HOST}:{cfg.PG_PORT}/{cfg.PG_DATABASE})...")
+
+        t0 = time.monotonic()
         conn = psycopg2.connect(**PG_CONN_PARAMS)
+        logger.info(f"Подключение установлено за {time.monotonic() - t0:.1f} сек.")
         cursor = conn.cursor()
 
         records = df.where(pd.notnull(df), None).values.tolist()
@@ -217,9 +224,15 @@ def load_csv_to_postgres() -> None:
             DO UPDATE SET {update_set}
         """
 
+        logger.info(f"Запускаю upsert {len(records)} записей...")
+        t0 = time.monotonic()
         execute_values(cursor, insert_query, records)
         conn.commit()
-        logger.info(f"Загружено {len(records)} записей в PostgreSQL ({TABLE_NAME}).")
+        logger.info(f"Загружено {len(records)} записей в PostgreSQL ({TABLE_NAME}) за {time.monotonic() - t0:.1f} сек.")
+    except psycopg2.OperationalError as e:
+        logger.error(f"Не удалось подключиться к PostgreSQL (сеть/VPN/таймаут): {e}")
+        if conn:
+            conn.rollback()
     except Exception as e:
         logger.error(f"Ошибка загрузки в PostgreSQL: {e}")
         if conn:

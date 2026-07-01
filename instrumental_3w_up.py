@@ -15,16 +15,25 @@ instrumental_3w_up.py
 
 import subprocess
 import pyautogui
+import socket
 import time
 import sys
 import os
 import sqlite3
+import requests
 import clickhouse_connect
 from datetime import datetime, timedelta, date
 import datetime as datetime_module
 
 from ntfy_notifier import send_ntfy_alert
 import personal_config as cfg
+
+# === Битрикс24 ===
+BITRIX_WEBHOOK     = cfg.BITRIX_WEBHOOK
+_BX_LOG_DIALOG     = "chat145691"  # полные логи
+_BX_SUMMARY_DIALOG = "chat145721"  # структурированный итог
+_BX_DASH_NAME      = "Медицина_ДКЦЛД — Не описанные исследования"
+_BX_DASH_URL       = "https://datalens.ru/4p1hmidf0tc8o-medicina-dkcld-ne-opisannye-issledovaniya"
 
 # === Настройки целевой ClickHouse ===
 CH_HOST_TARGET     = cfg.CH_HOST_TARGET
@@ -50,8 +59,9 @@ DISCONNECT_MENU_ITEM_X, DISCONNECT_MENU_ITEM_Y = cfg.DISCONNECT_MENU_ITEM_X, cfg
 CONFIRMATION_CLICK_X,   CONFIRMATION_CLICK_Y   = cfg.CONFIRMATION_CLICK_X,   cfg.CONFIRMATION_CLICK_Y
 
 _SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
-_BUFFER_PATH = os.path.join(_SCRIPTS_DIR, 'temp_buffer_instrumental_3w.db')
-_MON_BUFFER  = os.path.join(_SCRIPTS_DIR, 'temp_buffer_mon_3w.db')
+_BUFFER_PATH      = os.path.join(_SCRIPTS_DIR, 'temp_buffer_instrumental_3w.db')
+_MON_BUFFER       = os.path.join(_SCRIPTS_DIR, 'temp_buffer_mon_3w.db')
+_ETL_EVENTS_BUFFER = os.path.join(_SCRIPTS_DIR, 'temp_buffer_etl_events_3w.db')
 _TABLE_NAME  = 'instrumental_examinations_3w'
 _SQLITE_TMP  = 'temp_instrumental_3w'
 
@@ -62,8 +72,64 @@ MIN_SAFE_DATETIME      = datetime(1971, 1, 1, 0, 0, 0)
 MAX_SAFE_DATETIME      = datetime(2099, 12, 31, 23, 59, 59)
 MIN_SAFE_DATE          = date(1971, 1, 1)
 
+# Лог событий обновления исходных витрин (evnt.etl_events source CH → target CH)
+ETL_EVENTS_TABLE         = 'etl_events_vitrin_log'
+ETL_EVENTS_LOOKBACK_DAYS = 15
+ETL_EVENTS_ENTITIES = (
+    'data_views.v_instrumental_examinations',
+    'data_views.v_eris_assignment_results',
+    'data_views.v_route_eris_trauma',
+    'data_views.v_task_pin',
+)
+
 # Процедуры-исключения: всегда попадают в выборку даже с травма-аппаратов
 _TRAUMA_EXCEPT_RESEARCH_IDS = (33, 427, 34)
+
+# === Битрикс24-нотификации ===
+_run_log: list = []
+
+
+def _rlog(msg: str) -> None:
+    """Печатает и добавляет в лог-буфер для отправки в Битрикс."""
+    print(msg)
+    _run_log.append(msg)
+
+
+def _bx_send(dialog_id: str, text: str) -> None:
+    """Отправляет сообщение в чат Битрикс24 (чанкует если >3900 символов)."""
+    url = f"{BITRIX_WEBHOOK.rstrip('/')}/im.message.add.json"
+    chunks = [text[i:i + 3900] for i in range(0, max(len(text), 1), 3900)]
+    for chunk in chunks:
+        try:
+            resp = requests.post(url, json={"DIALOG_ID": dialog_id, "MESSAGE": chunk}, timeout=30)
+            if not resp.ok:
+                print(f"⚠️ Битрикс [{dialog_id}] {resp.status_code}: {resp.text[:200]}")
+        except Exception as e:
+            print(f"⚠️ Битрикс [{dialog_id}]: {e}")
+
+
+class _Tee:
+    """Дублирует вывод одновременно в несколько потоков (консоль + файл)."""
+    def __init__(self, *streams):
+        self._streams = streams
+
+    def write(self, data):
+        for s in self._streams:
+            try:
+                s.write(data)
+                s.flush()
+            except Exception:
+                pass
+
+    def flush(self):
+        for s in self._streams:
+            try:
+                s.flush()
+            except Exception:
+                pass
+
+    def fileno(self):
+        return self._streams[0].fileno()
 
 # Строго упорядоченный список колонок — порядок совпадает с SELECT в _build_query()
 _COLUMNS = [
@@ -151,16 +217,29 @@ def setup_sqlite_adapters():
     sqlite3.register_converter("timestamp", convert_ts)
 
 
+def _wait_for_dns(hostname: str, timeout: int = 40, interval: int = 3) -> bool:
+    """Ждёт, пока hostname начнёт резолвиться через DNS (VPN-туннель поднимается не мгновенно
+    после того, как клиент сообщает 'подключено' — отсюда NameResolutionError на части запусков)."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            socket.gethostbyname(hostname)
+            return True
+        except socket.gaierror:
+            time.sleep(interval)
+    return False
+
+
 # === VPN ===
 def connect_vpn():
-    print("🔄 Запускаю TrGUI...")
+    _rlog("🔄 Запускаю TrGUI...")
     send_ntfy_alert("Запускаю VPN для instrumental_3w...", title="VPN Connect", priority="default", tags="lock")
     try:
         process = subprocess.Popen(VPN_APP_PATH)
-        print(f"   PID: {process.pid}")
+        _rlog(f"   PID: {process.pid}")
     except Exception as e:
         msg = f"❌ Ошибка запуска VPN: {e}"
-        print(msg)
+        _rlog(msg)
         send_ntfy_alert(msg, title="VPN Error", priority="urgent", tags="warning")
         raise
     time.sleep(15)
@@ -169,7 +248,7 @@ def connect_vpn():
             try:
                 window.activate()
                 time.sleep(2)
-                print(f"✅ Окно '{window.title}' активировано.")
+                _rlog(f"✅ Окно '{window.title}' активировано.")
                 break
             except Exception:
                 pass
@@ -182,17 +261,23 @@ def connect_vpn():
     time.sleep(1)
     pyautogui.click(CONNECT_BUTTON_X, CONNECT_BUTTON_Y)
     time.sleep(15)
-    print("✅ VPN подключён.")
+
+    if _wait_for_dns(CH_HOST_SOURCE, timeout=40, interval=3):
+        _rlog(f"✅ DNS '{CH_HOST_SOURCE}' резолвится — туннель готов.")
+    else:
+        _rlog(f"⚠️ DNS '{CH_HOST_SOURCE}' не резолвится спустя 40с после подключения — пробую дальше как есть.")
+
+    _rlog("✅ VPN подключён.")
     send_ntfy_alert("VPN подключён", title="VPN Connected", priority="high", tags="key")
 
 
 def disconnect_vpn():
-    print("🛑 Отключаю VPN...")
+    _rlog("🛑 Отключаю VPN...")
     send_ntfy_alert("Отключаюсь от VPN...", title="VPN Disconnect", priority="default", tags="unlock")
     pyautogui.rightClick(RIGHT_CLICK_MENU_X, RIGHT_CLICK_MENU_Y); time.sleep(2)
     pyautogui.click(DISCONNECT_MENU_ITEM_X, DISCONNECT_MENU_ITEM_Y); time.sleep(3)
     pyautogui.click(CONFIRMATION_CLICK_X, CONFIRMATION_CLICK_Y); time.sleep(3)
-    print("🛑 VPN отключён.")
+    _rlog("🛑 VPN отключён.")
     send_ntfy_alert("VPN отключён", title="VPN Disconnected", priority="default", tags="check")
 
 
@@ -331,9 +416,9 @@ table_checks AS (
         'Описания рентгенологов'
     UNION ALL
     SELECT 'v_route_eris_trauma', 'auxiliary',
-        COALESCE((SELECT COUNT(*) FROM data_views.v_route_eris_trauma WHERE toDate(assignment_signed_date) >= today() - 1), 0),
-        COALESCE((SELECT toDateTime64(max(assignment_signed_date), 6, 'Europe/Moscow') FROM data_views.v_route_eris_trauma WHERE toDate(assignment_signed_date) >= today() - 1), toDateTime64('1971-01-01 00:00:00', 6, 'Europe/Moscow')),
-        COALESCE((SELECT toDateTime64(assignment_signed_date, 6, 'Europe/Moscow') FROM data_views.v_route_eris_trauma WHERE toDate(assignment_signed_date) >= today() - 1 ORDER BY assignment_signed_date DESC LIMIT 1 OFFSET 1), toDateTime64('1971-01-01 00:00:00', 6, 'Europe/Moscow')),
+        COALESCE((SELECT COUNT(*) FROM data_views.v_route_eris_trauma WHERE toDate(assignment_signed_date) >= today() - 3), 0),
+        COALESCE((SELECT toDateTime64(max(assignment_signed_date), 6, 'Europe/Moscow') FROM data_views.v_route_eris_trauma WHERE toDate(assignment_signed_date) >= today() - 3), toDateTime64('1971-01-01 00:00:00', 6, 'Europe/Moscow')),
+        COALESCE((SELECT toDateTime64(assignment_signed_date, 6, 'Europe/Moscow') FROM data_views.v_route_eris_trauma WHERE toDate(assignment_signed_date) >= today() - 3 ORDER BY assignment_signed_date DESC LIMIT 1 OFFSET 1), toDateTime64('1971-01-01 00:00:00', 6, 'Europe/Moscow')),
         'Травматологические направления'
     UNION ALL
     SELECT 'v_undescribed_researches', 'auxiliary',
@@ -377,6 +462,17 @@ SELECT qt.check_timestamp, ts.table_name, ts.table_type, ts.description, ts.row_
 FROM table_status ts CROSS JOIN query_time qt CROSS JOIN dashboard_status ds
 ORDER BY ts.table_type DESC, ts.table_name
 """
+
+
+def _build_etl_events_query() -> str:
+    entities_list = ', '.join(f"'{e}'" for e in ETL_EVENTS_ENTITIES)
+    return f"""
+        SELECT entity, loaded
+        FROM evnt.etl_events
+        WHERE entity IN ({entities_list})
+          AND loaded >= now() - INTERVAL {ETL_EVENTS_LOOKBACK_DAYS} DAY
+        ORDER BY entity, loaded
+    """
 
 
 def _build_query() -> str:
@@ -726,9 +822,45 @@ def _insert_monitoring(client_target, run_dt: datetime) -> None:
     )
 
 
+def _insert_etl_events(client_target) -> None:
+    """Читает лог обновлений витрин из SQLite-буфера и вставляет в ETL_EVENTS_TABLE.
+    ReplacingMergeTree по (entity, loaded) — повторные запуски не плодят дубли;
+    старше ETL_EVENTS_LOOKBACK_DAYS дней вычищается перед вставкой."""
+    if not os.path.exists(_ETL_EVENTS_BUFFER):
+        return
+
+    client_target.command(f"""
+        CREATE TABLE IF NOT EXISTS {ETL_EVENTS_TABLE} (
+            entity String,
+            loaded DateTime64(6, 'Europe/Moscow'),
+            load_datetime DateTime
+        )
+        ENGINE = ReplacingMergeTree()
+        ORDER BY (entity, loaded)
+    """)
+    client_target.command(
+        f"ALTER TABLE {ETL_EVENTS_TABLE} DELETE WHERE loaded < now() - interval {ETL_EVENTS_LOOKBACK_DAYS} day"
+    )
+
+    conn = sqlite3.connect(_ETL_EVENTS_BUFFER)
+    cur  = conn.cursor()
+    cur.execute("SELECT entity, loaded FROM temp_etl_events_data;")
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        print(f"📭 Лог витрин ({ETL_EVENTS_TABLE}): нет событий за {ETL_EVENTS_LOOKBACK_DAYS} дней.")
+        return
+
+    run_dt = datetime.now()
+    processed = [[entity, _parse_dt(loaded), run_dt] for entity, loaded in rows]
+    client_target.insert(ETL_EVENTS_TABLE, processed, column_names=['entity', 'loaded', 'load_datetime'])
+    print(f"✅ Лог витрин записан: {len(processed)} строк → {ETL_EVENTS_TABLE}")
+
+
 def export_instrumental_3w() -> bool:
     """Полный цикл: TRUNCATE → VPN → source CH → SQLite → VPN off → target CH."""
-    print("📊 [instrumental_3w] Загрузка за последние 7 дней (полная перезагрузка)...")
+    _rlog("📊 [instrumental_3w] Загрузка за последние 7 дней (полная перезагрузка)...")
     send_ntfy_alert(
         "Начинаю синхронизацию instrumental_examinations_3w...",
         title="Instrumental 3W Start", priority="default", tags="inbox",
@@ -738,7 +870,7 @@ def export_instrumental_3w() -> bool:
     # Шаг 1: Создание таблицы + TRUNCATE
     client_target_del = None
     try:
-        print("🧹 Подключаюсь к целевой базе (очистка старых загрузок)...")
+        _rlog("🧹 Подключаюсь к целевой базе (очистка старых загрузок)...")
         client_target_del = clickhouse_connect.get_client(
             host=CH_HOST_TARGET, port=CH_PORT_TARGET,
             username=CH_USER_TARGET, password=CH_PASSWORD_TARGET,
@@ -748,12 +880,12 @@ def export_instrumental_3w() -> bool:
         client_target_del.command(
             f"ALTER TABLE {_TABLE_NAME} DELETE WHERE load_datetime < now() - interval 5 day"
         )
-        print(f"✅ Загрузки старше 5 дней удалены из {_TABLE_NAME}.")
+        _rlog(f"✅ Загрузки старше 5 дней удалены из {_TABLE_NAME}.")
         client_target_del.close()
         client_target_del = None
     except Exception as e:
         msg = f"❌ Ошибка TRUNCATE: {e}"
-        print(msg)
+        _rlog(msg)
         send_ntfy_alert(f"Ошибка очистки БД: {str(e)[:80]}", title="Instrumental 3W Error",
                         priority="urgent", tags="database")
         if client_target_del:
@@ -764,37 +896,71 @@ def export_instrumental_3w() -> bool:
     client_source = None
     try:
         connect_vpn()
-        client_source = clickhouse_connect.get_client(
-            host=CH_HOST_SOURCE, port=CH_PORT_SOURCE,
-            username=CH_USER_SOURCE, password=CH_PASSWORD_SOURCE,
-            database=CH_DATABASE_SOURCE, secure=True, verify=False,
-            send_receive_timeout=94200, connect_timeout=999999,
-        )
-        print("✅ Исходная ClickHouse подключена.")
 
-        print("📥 Выполняю запрос...")
+        for attempt in range(1, 4):
+            try:
+                client_source = clickhouse_connect.get_client(
+                    host=CH_HOST_SOURCE, port=CH_PORT_SOURCE,
+                    username=CH_USER_SOURCE, password=CH_PASSWORD_SOURCE,
+                    database=CH_DATABASE_SOURCE, secure=True, verify=False,
+                    send_receive_timeout=94200, connect_timeout=999999,
+                )
+                _rlog("✅ Исходная ClickHouse подключена.")
+                break
+            except Exception as e_conn:
+                _rlog(f"⚠️ Подключение к источнику, попытка {attempt}: {e_conn}")
+                client_source = None
+                if attempt < 3:
+                    _wait_for_dns(CH_HOST_SOURCE, timeout=20, interval=2)
+                else:
+                    raise
+
+        _rlog("📥 Выполняю запрос...")
         result    = client_source.query(_build_query())
         raw_rows  = result.result_rows
         col_names = result.column_names
-        print(f"📥 Получено {len(raw_rows)} строк. Колонок CH: {len(col_names)}, ожидается: {len(_COLUMNS)}")
+        _rlog(f"📥 Получено {len(raw_rows)} строк. Колонок CH: {len(col_names)}, ожидается: {len(_COLUMNS) - 2}")
 
         # Попутно выполняем мониторинговый запрос (VPN активен, соединение ещё открыто)
-        print("🔍 Выполняю мониторинговый запрос...")
+        _rlog("🔍 Выполняю мониторинговый запрос...")
         try:
             mon_result    = client_source.query(_build_monitoring_query())
             mon_raw_rows  = mon_result.result_rows
             mon_col_names = mon_result.column_names
-            print(f"✅ Мониторинг: получено {len(mon_raw_rows)} строк.")
+            _rlog(f"✅ Мониторинг: получено {len(mon_raw_rows)} строк.")
         except Exception as e_mon:
             mon_raw_rows  = []
             mon_col_names = []
-            print(f"⚠️ Мониторинг пропущен (ошибка запроса): {e_mon}")
+            _rlog(f"⚠️ Мониторинг пропущен (ошибка запроса): {e_mon}")
+
+        # Лог обновлений витрин (evnt.etl_events) — попутно, пока VPN активен
+        _rlog("🔍 Выполняю запрос лога витрин (evnt.etl_events)...")
+        try:
+            etl_events_result = client_source.query(_build_etl_events_query())
+            etl_events_rows    = etl_events_result.result_rows
+            _rlog(f"✅ Лог витрин: получено {len(etl_events_rows)} строк.")
+        except Exception as e_etl:
+            etl_events_rows = []
+            _rlog(f"⚠️ Лог витрин пропущен (ошибка запроса): {e_etl}")
+
+        if etl_events_rows:
+            conn_e = sqlite3.connect(_ETL_EVENTS_BUFFER)
+            cur_e  = conn_e.cursor()
+            cur_e.execute("DROP TABLE IF EXISTS temp_etl_events_data;")
+            cur_e.execute("CREATE TABLE temp_etl_events_data (entity TEXT, loaded TEXT);")
+            cur_e.executemany(
+                "INSERT INTO temp_etl_events_data VALUES (?, ?);",
+                [(e, str(l)) for e, l in etl_events_rows],
+            )
+            conn_e.commit()
+            conn_e.close()
+            _rlog("✅ SQLite буфер лога витрин заполнен.")
 
         client_source.close()
         client_source = None
 
         if not raw_rows:
-            print("📭 Нет данных за последние 7 дней.")
+            _rlog("📭 Нет данных за последние 7 дней.")
             send_ntfy_alert("Нет данных instrumental_3w", title="Instrumental 3W Empty",
                             priority="default", tags="inbox")
             disconnect_vpn()
@@ -804,7 +970,7 @@ def export_instrumental_3w() -> bool:
         ordered_rows = _rows_to_sqlite(raw_rows, col_names)
 
         # Шаг 3: SQLite буфер (CREATE по _COLUMNS, INSERT позиционно)
-        print(f"💾 Создаю SQLite буфер ({_BUFFER_PATH})...")
+        _rlog(f"💾 Создаю SQLite буфер ({_BUFFER_PATH})...")
         conn   = sqlite3.connect(_BUFFER_PATH)
         cursor = conn.cursor()
         cursor.execute(f"DROP TABLE IF EXISTS {_SQLITE_TMP};")
@@ -817,7 +983,7 @@ def export_instrumental_3w() -> bool:
         )
         conn.commit()
         conn.close()
-        print("✅ SQLite буфер заполнен.")
+        _rlog("✅ SQLite буфер заполнен.")
 
         # SQLite буфер для мониторинга
         if mon_raw_rows:
@@ -840,7 +1006,7 @@ def export_instrumental_3w() -> bool:
 
     except Exception as e:
         msg = f"❌ Ошибка source CH / SQLite: {e}"
-        print(msg)
+        _rlog(msg)
         send_ntfy_alert(f"Сбой instrumental_3w: {str(e)[:80]}", title="Instrumental 3W Error",
                         priority="urgent", tags="fire")
         if client_source:
@@ -861,6 +1027,8 @@ def export_instrumental_3w() -> bool:
 
     # Шаг 5: Вставка в target CH
     client_target = None
+    _BATCH_SIZE = 1000
+
     for attempt in range(1, 4):
         try:
             print(f"🔌 Подключаюсь к целевой ClickHouse (попытка {attempt})...")
@@ -868,6 +1036,7 @@ def export_instrumental_3w() -> bool:
                 host=CH_HOST_TARGET, port=CH_PORT_TARGET,
                 username=CH_USER_TARGET, password=CH_PASSWORD_TARGET,
                 database=CH_DATABASE_TARGET, secure=True, verify=False,
+                send_receive_timeout=600, connect_timeout=30,
             )
             break
         except Exception as e:
@@ -892,11 +1061,14 @@ def export_instrumental_3w() -> bool:
         run_dt = datetime.now()
         processed_rows = [_process_row(row, run_dt) for row in sqlite_rows]
 
-        print(f"📤 Загружаю {len(processed_rows)} строк в {CH_DATABASE_TARGET}.{_TABLE_NAME}...")
-        client_target.insert(_TABLE_NAME, processed_rows, column_names=_COLUMNS)
+        _rlog(f"📤 Загружаю {len(processed_rows)} строк в {CH_DATABASE_TARGET}.{_TABLE_NAME} (батчами по {_BATCH_SIZE})...")
+        for batch_start in range(0, len(processed_rows), _BATCH_SIZE):
+            batch = processed_rows[batch_start:batch_start + _BATCH_SIZE]
+            client_target.insert(_TABLE_NAME, batch, column_names=_COLUMNS)
+            print(f"   ✔ Загружено {min(batch_start + _BATCH_SIZE, len(processed_rows))}/{len(processed_rows)}")
 
         msg = f"✅ [instrumental_3w] Синхронизировано {len(processed_rows)} строк."
-        print(msg)
+        _rlog(msg)
         send_ntfy_alert(msg, title="Instrumental 3W Success", priority="high", tags="white_check_mark")
 
         # Вставка мониторинговых данных в target CH
@@ -906,10 +1078,17 @@ def export_instrumental_3w() -> bool:
             except Exception as e_mon:
                 print(f"⚠️ Мониторинг не записан: {e_mon}")
 
+        # Вставка лога обновлений витрин (evnt.etl_events) в target CH
+        if os.path.exists(_ETL_EVENTS_BUFFER):
+            try:
+                _insert_etl_events(client_target)
+            except Exception as e_etl:
+                print(f"⚠️ Лог витрин не записан: {e_etl}")
+
         client_target.close()
         client_target = None
 
-        for buf in (_BUFFER_PATH, _MON_BUFFER):
+        for buf in (_BUFFER_PATH, _MON_BUFFER, _ETL_EVENTS_BUFFER):
             try:
                 if os.path.exists(buf):
                     os.remove(buf)
@@ -921,7 +1100,7 @@ def export_instrumental_3w() -> bool:
 
     except Exception as e:
         msg = f"❌ Ошибка выгрузки в целевую ClickHouse: {e}"
-        print(msg)
+        _rlog(msg)
         send_ntfy_alert(f"Ошибка выгрузки instrumental_3w: {str(e)[:80]}",
                         title="Instrumental 3W Insert Error", priority="urgent", tags="database")
         if client_target:
@@ -943,12 +1122,23 @@ def extract_phase() -> bool:
     setup_sqlite_adapters()
     client_source = None
     try:
-        client_source = clickhouse_connect.get_client(
-            host=CH_HOST_SOURCE, port=CH_PORT_SOURCE,
-            username=CH_USER_SOURCE, password=CH_PASSWORD_SOURCE,
-            database=CH_DATABASE_SOURCE, secure=True, verify=False,
-            send_receive_timeout=94200, connect_timeout=999999,
-        )
+        for attempt in range(1, 4):
+            try:
+                client_source = clickhouse_connect.get_client(
+                    host=CH_HOST_SOURCE, port=CH_PORT_SOURCE,
+                    username=CH_USER_SOURCE, password=CH_PASSWORD_SOURCE,
+                    database=CH_DATABASE_SOURCE, secure=True, verify=False,
+                    send_receive_timeout=94200, connect_timeout=999999,
+                )
+                break
+            except Exception as e_conn:
+                print(f"⚠️ [instrumental_3w] Подключение к источнику, попытка {attempt}: {e_conn}")
+                client_source = None
+                if attempt < 3:
+                    _wait_for_dns(CH_HOST_SOURCE, timeout=20, interval=2)
+                else:
+                    raise
+
         result = client_source.query(_build_query())
         # Сохраняем уже переупорядоченные строки
         _buffer_rows_3w = _rows_to_sqlite(result.result_rows, result.column_names)
@@ -980,6 +1170,27 @@ def extract_phase() -> bool:
         except Exception as e_mon:
             print(f"⚠️ [instrumental_3w] Мониторинг пропущен (ошибка запроса): {e_mon}")
 
+        # Лог обновлений витрин (evnt.etl_events) — пока VPN активен и соединение открыто
+        print("🔍 [instrumental_3w] Выполняю запрос лога витрин (evnt.etl_events)...")
+        try:
+            etl_events_result = client_source.query(_build_etl_events_query())
+            etl_events_rows    = etl_events_result.result_rows
+            print(f"✅ [instrumental_3w] Лог витрин: получено {len(etl_events_rows)} строк.")
+            if etl_events_rows:
+                conn_e = sqlite3.connect(_ETL_EVENTS_BUFFER)
+                cur_e  = conn_e.cursor()
+                cur_e.execute("DROP TABLE IF EXISTS temp_etl_events_data;")
+                cur_e.execute("CREATE TABLE temp_etl_events_data (entity TEXT, loaded TEXT);")
+                cur_e.executemany(
+                    "INSERT INTO temp_etl_events_data VALUES (?, ?);",
+                    [(e, str(l)) for e, l in etl_events_rows],
+                )
+                conn_e.commit()
+                conn_e.close()
+                print("✅ [instrumental_3w] SQLite буфер лога витрин заполнен.")
+        except Exception as e_etl:
+            print(f"⚠️ [instrumental_3w] Лог витрин пропущен (ошибка запроса): {e_etl}")
+
         client_source.close()
         client_source = None
         print(f"✅ [instrumental_3w] extract_phase: сохранено {len(_buffer_rows_3w)} строк.")
@@ -999,6 +1210,8 @@ def load_phase() -> bool:
         return False
 
     client_target = None
+    _BATCH_SIZE = 1000
+
     for attempt in range(1, 4):
         try:
             print(f"🔌 [instrumental_3w] Подключаюсь (попытка {attempt})...")
@@ -1006,6 +1219,7 @@ def load_phase() -> bool:
                 host=CH_HOST_TARGET, port=CH_PORT_TARGET,
                 username=CH_USER_TARGET, password=CH_PASSWORD_TARGET,
                 database=CH_DATABASE_TARGET, secure=True, verify=False,
+                send_receive_timeout=600, connect_timeout=30,
             )
             break
         except Exception as e:
@@ -1024,14 +1238,23 @@ def load_phase() -> bool:
 
         if not _buffer_rows_3w:
             print("📭 [instrumental_3w] load_phase: 0 строк в буфере, нет данных за 7 дней.")
+            if os.path.exists(_ETL_EVENTS_BUFFER):
+                try:
+                    _insert_etl_events(client_target)
+                    os.remove(_ETL_EVENTS_BUFFER)
+                except Exception as e_etl:
+                    print(f"⚠️ [instrumental_3w] Лог витрин не записан: {e_etl}")
             client_target.close()
             _buffer_rows_3w = None
             return True
 
         run_dt = datetime.now()
         processed_rows = [_process_row(row, run_dt) for row in _buffer_rows_3w]
-        print(f"📤 [instrumental_3w] load_phase: вставляю {len(processed_rows)} строк...")
-        client_target.insert(_TABLE_NAME, processed_rows, column_names=_COLUMNS)
+        print(f"📤 [instrumental_3w] load_phase: вставляю {len(processed_rows)} строк (батчами по {_BATCH_SIZE})...")
+        for batch_start in range(0, len(processed_rows), _BATCH_SIZE):
+            batch = processed_rows[batch_start:batch_start + _BATCH_SIZE]
+            client_target.insert(_TABLE_NAME, batch, column_names=_COLUMNS)
+            print(f"   ✔ [instrumental_3w] Загружено {min(batch_start + _BATCH_SIZE, len(processed_rows))}/{len(processed_rows)}")
 
         msg = f"✅ [instrumental_3w] load_phase: вставлено {len(processed_rows)} строк."
         print(msg)
@@ -1044,12 +1267,21 @@ def load_phase() -> bool:
             except Exception as e_mon:
                 print(f"⚠️ [instrumental_3w] Мониторинг не записан: {e_mon}")
 
+        # Вставка лога обновлений витрин (evnt.etl_events) в target CH
+        if os.path.exists(_ETL_EVENTS_BUFFER):
+            try:
+                _insert_etl_events(client_target)
+            except Exception as e_etl:
+                print(f"⚠️ [instrumental_3w] Лог витрин не записан: {e_etl}")
+
         client_target.close()
         _buffer_rows_3w = None
 
         try:
             if os.path.exists(_MON_BUFFER):
                 os.remove(_MON_BUFFER)
+            if os.path.exists(_ETL_EVENTS_BUFFER):
+                os.remove(_ETL_EVENTS_BUFFER)
         except Exception:
             pass
 
@@ -1063,20 +1295,62 @@ def load_phase() -> bool:
 
 # === Основная точка входа ===
 def main():
-    print("🚀 Запуск instrumental_3w (7 дней, полная перезагрузка)")
+    global _run_log
+    _run_log = []
+    _start = datetime.now()
+
+    # --- Файловый лог ---
+    _log_path   = os.path.join(_SCRIPTS_DIR, f"instrumental_3w_log_{_start.strftime('%Y-%m-%d_%H-%M-%S')}.log")
+    _log_file   = open(_log_path, 'w', encoding='utf-8')
+    _orig_stdout = sys.stdout
+    _orig_stderr = sys.stderr
+    sys.stdout  = _Tee(sys.__stdout__, _log_file)
+    sys.stderr  = _Tee(sys.__stderr__, _log_file)
+    print(f"📝 Лог: {_log_path}")
+    # ---
+
+    _rlog("🚀 Запуск instrumental_3w (7 дней, полная перезагрузка)")
     send_ntfy_alert("Запускаю instrumental_3w...", title="Instrumental 3W Start",
                     priority="default", tags="robot")
     success = export_instrumental_3w()
+
+    now_str  = _start.strftime("%d.%m.%Y")
+    dur_str  = str(datetime.now() - _start).split('.')[0]
+
     if success:
         send_ntfy_alert("✅ instrumental_examinations_3w обновлена!",
                         title="Dashbord Done", priority="high", tags="tada",
                         topic_override="push_mrc_dashboards_7895")
-        print("🏁 Готово.")
+        _rlog("🏁 Готово.")
+        bx_status = f"  ✅  instrumental_examinations_3w\n       [B][URL={_BX_DASH_URL}]{_BX_DASH_NAME}[/URL][/B]"
     else:
         send_ntfy_alert("❌ Ошибка обновления instrumental_examinations_3w!",
                         title="Dashbord Failed", priority="urgent", tags="warning",
                         topic_override="push_mrc_dashboards_7895")
-        print("❌ Завершено с ошибками.")
+        _rlog("❌ Завершено с ошибками.")
+        bx_status = f"  ❌  instrumental_examinations_3w\n       [B][URL={_BX_DASH_URL}]{_BX_DASH_NAME}[/URL][/B]"
+
+    # chat145691: полный лог из файла
+    try:
+        _log_file.flush()
+        with open(_log_path, encoding='utf-8') as _lf:
+            full_log_text = _lf.read()
+        bx_full_msg = f"[instrumental_3w] {now_str} | {dur_str}\n\n" + full_log_text
+    except Exception as _e:
+        bx_full_msg = f"[instrumental_3w] {now_str} | {dur_str}\n\n" + "\n".join(_run_log) + f"\n(лог-файл недоступен: {_e})"
+
+    _bx_send(_BX_LOG_DIALOG, bx_full_msg)
+    # chat145721: структурированный итог с BB-кодами
+    _bx_send(_BX_SUMMARY_DIALOG,
+             f"[B]instrumental_3w[/B]  {now_str}\nВремя: {dur_str}\n\n{bx_status}")
+
+    # --- Закрываем лог-файл ---
+    sys.stdout = _orig_stdout
+    sys.stderr = _orig_stderr
+    _log_file.close()
+    print(f"📝 Лог сохранён: {_log_path}")
+    # ---
+
     return success
 
 

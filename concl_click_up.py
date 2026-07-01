@@ -36,7 +36,7 @@ CH_PASSWORD_SOURCE = cfg.CH_PASSWORD
 CH_DATABASE_SOURCE = cfg.CH_DATABASE
 
 # === Настройки синхронизации (плавающие даты) ===
-DAYS_TO_SYNC = 64
+DAYS_TO_SYNC = 34
 
 _BUFFER_CONCL = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'temp_buffer_summary.db')
 _CONCL_COLUMNS = [
@@ -546,7 +546,7 @@ def export_instrumental_summary():
                 min(JSONExtractString(JSONExtractString(raw_data, 'aiResult'), 'norma')) AS norma_value
             FROM dwh_views.v_eris_report
             WHERE app_source = 'CDS'
-            AND parseDateTimeBestEffort(JSONExtractString(computed_data, 'pumStudyReadyForAiTime')) IS NOT NULL
+            AND parseDateTimeBestEffortOrNull(JSONExtractString(computed_data, 'pumStudyReadyForAiTime')) IS NOT NULL
             AND JSONExtractString(raw_data, 'studyIUID') != ''
             GROUP BY studyIUID
         ) ai_res ON t2.study_uid = ai_res.studyIUID
@@ -633,7 +633,7 @@ def export_instrumental_summary():
                     min(JSONExtractString(JSONExtractString(raw_data, 'aiResult'), 'norma')) AS norma_value
                 FROM dwh_views.v_eris_report
                 WHERE app_source = 'CDS'
-                AND parseDateTimeBestEffort(JSONExtractString(computed_data, 'pumStudyReadyForAiTime')) IS NOT NULL
+                AND parseDateTimeBestEffortOrNull(JSONExtractString(computed_data, 'pumStudyReadyForAiTime')) IS NOT NULL
                 AND JSONExtractString(raw_data, 'studyIUID') != ''
                 GROUP BY studyIUID
             ) ai_res ON t2.study_uid = ai_res.studyIUID
@@ -1055,10 +1055,10 @@ def extract_phase():
             multiIf(pin_res.max_task_pin_end_date IS NOT NULL, 1, 0) AS has_task_pin_record,
             multiIf(trauma_res.accession_number IS NOT NULL, 1, 0) AS trauma_after_orthopedist_flag,
             multiIf(
-                dateDiff('hour', COALESCE(pin_res.max_task_pin_end_date, (toTimeZone(toDateTime(t2.conduct_date), 'Europe/Moscow'))),
-                    (toTimeZone(toDateTime(t2.assignment_result_doc_created_date), 'Europe/Moscow'))) < 24, 'Менее 24 часов',
-                dateDiff('hour', COALESCE(pin_res.max_task_pin_end_date, (toTimeZone(toDateTime(t2.conduct_date), 'Europe/Moscow'))),
-                    (toTimeZone(toDateTime(t2.assignment_result_doc_created_date), 'Europe/Moscow'))) < 48, 'Более 24 часов',
+                intDiv(dateDiff('second', COALESCE(pin_res.max_task_pin_end_date, (toTimeZone(toDateTime(t2.conduct_date), 'Europe/Moscow'))),
+                    (toTimeZone(toDateTime(t2.assignment_result_doc_created_date), 'Europe/Moscow'))), 3600) < 24, 'Менее 24 часов',
+                intDiv(dateDiff('second', COALESCE(pin_res.max_task_pin_end_date, (toTimeZone(toDateTime(t2.conduct_date), 'Europe/Moscow'))),
+                    (toTimeZone(toDateTime(t2.assignment_result_doc_created_date), 'Europe/Moscow'))), 3600) < 48, 'Более 24 часов',
                 'Более 48 часов'
             ) AS time_interval,
             countDistinct(t2.accession_number) AS cnt,
@@ -1068,12 +1068,12 @@ def extract_phase():
             0.0 AS tarif
         FROM data_views.v_eris_assignment_results t2
         LEFT JOIN (SELECT accession_number, any(patient_age) AS patient_age FROM data_views.v_instrumental_examinations WHERE accession_number != '' GROUP BY accession_number) ie ON t2.accession_number = ie.accession_number
-        LEFT JOIN (SELECT JSONExtractString(raw_data, 'studyIUID') AS studyIUID, min(JSONExtractString(JSONExtractString(raw_data, 'aiResult'), 'norma')) AS norma_value FROM dwh_views.v_eris_report WHERE app_source = 'CDS' AND parseDateTimeBestEffort(JSONExtractString(computed_data, 'pumStudyReadyForAiTime')) IS NOT NULL AND JSONExtractString(raw_data, 'studyIUID') != '' GROUP BY studyIUID) ai_res ON t2.study_uid = ai_res.studyIUID
+        LEFT JOIN (SELECT JSONExtractString(raw_data, 'studyIUID') AS studyIUID, min(JSONExtractString(JSONExtractString(raw_data, 'aiResult'), 'norma')) AS norma_value FROM dwh_views.v_eris_report WHERE app_source = 'CDS' AND parseDateTimeBestEffortOrNull(JSONExtractString(computed_data, 'pumStudyReadyForAiTime')) IS NOT NULL AND JSONExtractString(raw_data, 'studyIUID') != '' GROUP BY studyIUID) ai_res ON t2.study_uid = ai_res.studyIUID
         LEFT JOIN (SELECT studyIUID, 1 AS has_defect_ab FROM (SELECT studyIUID, if(modelId IN (1150,1099,1181,1186,1187,1182,1190,1185,1253), time_diff_min >= 3, time_diff_min >= 6.5) AS defect_a, defect_b FROM (SELECT studyIUID, modelId, max(has_error OR is_raw_null) AS defect_b, dateDiff('second', min(ready_time), max(greatest(sent_time, latest_time))) / 60.0 AS time_diff_min FROM (SELECT if(raw_data='null', JSONExtractString(computed_data,'studyUid'), JSONExtractString(raw_data,'studyIUID')) AS studyIUID, if(raw_data='null', JSONExtractInt(computed_data,'modelId'), JSONExtractInt(raw_data,'aiResult','modelId')) AS modelId, parseDateTimeBestEffortOrNull(replaceRegexpAll(JSONExtractString(computed_data,'pumStudyReadyForAiTime'),':(60)(\\.\\d+)?',':59.000')) AS ready_time, parseDateTimeBestEffortOrNull(replaceRegexpAll(JSONExtractString(computed_data,'pumReportSentTime'),':(60)(\\.\\d+)?',':59.000')) AS sent_time, parseDateTimeBestEffortOrNull(replaceRegexpAll(JSONExtractString(computed_data,'pumReportLatestDicomInstanceTime'),':(60)(\\.\\d+)?',':59.000')) AS latest_time, raw_data='null' AS is_raw_null, if(raw_data='null', 1, JSONExtractString(raw_data,'aiResult','error') != '') AS has_error FROM dwh_views.v_eris_report WHERE app_source='CDS' AND parseDateTimeBestEffortOrNull(JSONExtractString(computed_data,'pumStudyReadyForAiTime')) >= '2025-09-01 00:00:00') GROUP BY studyIUID, modelId)) WHERE defect_a=1 OR defect_b=1) ai_res_2 ON t2.study_uid = ai_res_2.studyIUID
         LEFT JOIN (SELECT DISTINCT accession_number FROM data_views.v_route_eris_trauma WHERE accession_number != '') trauma_res ON t2.accession_number = trauma_res.accession_number
         LEFT JOIN (SELECT accession_number, toTimeZone(toDateTime(max(task_pin_end_date)), 'Europe/Moscow') AS max_task_pin_end_date FROM data_views.v_task_pin WHERE accession_number != '' GROUP BY accession_number) pin_res ON t2.accession_number = pin_res.accession_number
         LEFT JOIN diagnostic_dict AS diagnostic_ref ON t2.diagnostic_code = diagnostic_ref.diagnostic_code
-        LEFT JOIN (SELECT t2.accession_number, sum(CASE WHEN t2.diagnostic_code IN ('34','33','427') AND ai_res.norma_value='1' THEN 0.3 WHEN diagnostic_ref.service_type='КТ с КУ 1 зона' THEN 30.41 WHEN diagnostic_ref.service_type='КТ с КУ 2 и более зон' THEN 49.75 WHEN diagnostic_ref.service_type='КТ 1 зона' THEN 11.58 WHEN diagnostic_ref.service_type='КТ 2 и более зон' THEN 11.58 WHEN diagnostic_ref.service_type='МРТ 1 зона' THEN 15.06 WHEN diagnostic_ref.service_type='МРТ 2 и более зон' THEN 15.06 WHEN diagnostic_ref.service_type='МРТ с КУ 1 зона' THEN 34.71 WHEN diagnostic_ref.service_type='МРТ с КУ 2 и более зон' THEN 60.25 WHEN diagnostic_ref.service_type='ММГ' THEN 3.67 WHEN diagnostic_ref.service_type='РГ' THEN 3.67 WHEN diagnostic_ref.service_type='ФЛГ' THEN 1.0 WHEN diagnostic_ref.service_type='Денс' THEN 2.15 ELSE 1.0 END) AS total_coefficient FROM data_views.v_eris_assignment_results t2 LEFT JOIN (SELECT JSONExtractString(raw_data,'studyIUID') AS studyIUID, min(JSONExtractString(JSONExtractString(raw_data,'aiResult'),'norma')) AS norma_value FROM dwh_views.v_eris_report WHERE app_source='CDS' AND parseDateTimeBestEffort(JSONExtractString(computed_data,'pumStudyReadyForAiTime')) IS NOT NULL AND JSONExtractString(raw_data,'studyIUID') != '' GROUP BY studyIUID) ai_res ON t2.study_uid=ai_res.studyIUID LEFT JOIN diagnostic_dict AS diagnostic_ref ON t2.diagnostic_code=diagnostic_ref.diagnostic_code WHERE t2.accession_number != '' GROUP BY t2.accession_number) AS coeff ON t2.accession_number = coeff.accession_number
+        LEFT JOIN (SELECT t2.accession_number, sum(CASE WHEN t2.diagnostic_code IN ('34','33','427') AND ai_res.norma_value='1' THEN 0.3 WHEN diagnostic_ref.service_type='КТ с КУ 1 зона' THEN 30.41 WHEN diagnostic_ref.service_type='КТ с КУ 2 и более зон' THEN 49.75 WHEN diagnostic_ref.service_type='КТ 1 зона' THEN 11.58 WHEN diagnostic_ref.service_type='КТ 2 и более зон' THEN 11.58 WHEN diagnostic_ref.service_type='МРТ 1 зона' THEN 15.06 WHEN diagnostic_ref.service_type='МРТ 2 и более зон' THEN 15.06 WHEN diagnostic_ref.service_type='МРТ с КУ 1 зона' THEN 34.71 WHEN diagnostic_ref.service_type='МРТ с КУ 2 и более зон' THEN 60.25 WHEN diagnostic_ref.service_type='ММГ' THEN 3.67 WHEN diagnostic_ref.service_type='РГ' THEN 3.67 WHEN diagnostic_ref.service_type='ФЛГ' THEN 1.0 WHEN diagnostic_ref.service_type='Денс' THEN 2.15 ELSE 1.0 END) AS total_coefficient FROM data_views.v_eris_assignment_results t2 LEFT JOIN (SELECT JSONExtractString(raw_data,'studyIUID') AS studyIUID, min(JSONExtractString(JSONExtractString(raw_data,'aiResult'),'norma')) AS norma_value FROM dwh_views.v_eris_report WHERE app_source='CDS' AND parseDateTimeBestEffortOrNull(JSONExtractString(computed_data,'pumStudyReadyForAiTime')) IS NOT NULL AND JSONExtractString(raw_data,'studyIUID') != '' GROUP BY studyIUID) ai_res ON t2.study_uid=ai_res.studyIUID LEFT JOIN diagnostic_dict AS diagnostic_ref ON t2.diagnostic_code=diagnostic_ref.diagnostic_code WHERE t2.accession_number != '' GROUP BY t2.accession_number) AS coeff ON t2.accession_number = coeff.accession_number
         WHERE t2.accession_number != ''
         """
         date_clause = f"  AND toDate(toTimeZone(toDateTime(t2.assignment_result_doc_created_date), 'Europe/Moscow')) >= '{n_days_ago.isoformat()}' AND toDate(toTimeZone(toDateTime(t2.assignment_result_doc_created_date), 'Europe/Moscow')) <= '{today.isoformat()}'"

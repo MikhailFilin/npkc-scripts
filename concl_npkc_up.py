@@ -185,7 +185,7 @@ LEFT JOIN (
         min(JSONExtractString(JSONExtractString(raw_data, 'aiResult'), 'norma')) AS norma_value
     FROM dwh_views.v_eris_report
     WHERE app_source = 'CDS'
-      AND parseDateTimeBestEffort(JSONExtractString(computed_data, 'pumStudyReadyForAiTime')) IS NOT NULL
+      AND parseDateTimeBestEffortOrNull(JSONExtractString(computed_data, 'pumStudyReadyForAiTime')) IS NOT NULL
       AND JSONExtractString(raw_data, 'studyIUID') != ''
     GROUP BY studyIUID
 ) ai_res ON t2.study_uid = ai_res.studyIUID

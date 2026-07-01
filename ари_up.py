@@ -20,6 +20,33 @@ import datetime as datetime_module
 from ntfy_notifier import send_ntfy_alert
 import personal_config as cfg
 
+# === Битрикс24 ===
+BITRIX_WEBHOOK     = cfg.BITRIX_WEBHOOK
+_BX_LOG_DIALOG     = "chat145691"
+_BX_SUMMARY_DIALOG = "chat145721"
+_BX_DASH_NAME      = "АРИ — Описания ЕРИС (cometa_conclusions_summary_new)"
+_BX_DASH_URL       = ""   # отдельного дашборда нет
+
+_run_log: list = []
+
+
+def _rlog(msg: str) -> None:
+    print(msg)
+    _run_log.append(msg)
+
+
+def _bx_send(dialog_id: str, text: str) -> None:
+    url = f"{BITRIX_WEBHOOK.rstrip('/')}/im.message.add.json"
+    chunks = [text[i:i + 3900] for i in range(0, max(len(text), 1), 3900)]
+    for chunk in chunks:
+        try:
+            resp = requests.post(url, json={"DIALOG_ID": dialog_id, "MESSAGE": chunk}, timeout=30)
+            if not resp.ok:
+                print(f"⚠️ Битрикс [{dialog_id}] {resp.status_code}: {resp.text[:200]}")
+        except Exception as e:
+            print(f"⚠️ Битрикс [{dialog_id}]: {e}")
+
+
 # === Настройки целевой ClickHouse базы ===
 CH_HOST_TARGET = cfg.CH_HOST_TARGET
 CH_PORT_TARGET = cfg.CH_PORT_TARGET
@@ -201,7 +228,7 @@ def export_cometa_conclusions_summary():
     Returns:
         bool: True если успешно, False если ошибка
     """
-    print(f"📊 Загрузка cometa_conclusions_summary_new за последние {DAYS_TO_SYNC} дней...")
+    _rlog(f"📊 Загрузка cometa_conclusions_summary_new за последние {DAYS_TO_SYNC} дней...")
     send_ntfy_alert(
         f"Начинаю синхронизацию Cometa New за {DAYS_TO_SYNC} дней...",
         title="Cometa New Sync Start",
@@ -222,13 +249,13 @@ def export_cometa_conclusions_summary():
     temp_db_name = "temp_buffer_cometa_new.db"
     
     try:
-        print("🔌 Подключаюсь к целевой базе...")
+        _rlog("🔌 Подключаюсь к целевой базе...")
         client_target = clickhouse_connect.get_client(
             host=CH_HOST_TARGET, port=CH_PORT_TARGET,
             username=CH_USER_TARGET, password=CH_PASSWORD_TARGET,
             database=CH_DATABASE_TARGET, secure=True, verify=False
         )
-        print("✅ Целевая ClickHouse подключена.")
+        _rlog("✅ Целевая ClickHouse подключена.")
         
         table_name = 'cometa_conclusions_summary_new'
         
@@ -268,16 +295,16 @@ def export_cometa_conclusions_summary():
         
         # Удаляем только последние DAYS_TO_SYNC дней — старые данные остаются
         start_date_del = (today - timedelta(days=DAYS_TO_SYNC)).strftime('%Y-%m-%d')
-        print(f"🧹 Удаляю данные за последние {DAYS_TO_SYNC} дней (с {start_date_del}) из {table_name}...")
+        _rlog(f"🧹 Удаляю данные за последние {DAYS_TO_SYNC} дней (с {start_date_del}) из {table_name}...")
         delete_query = f"ALTER TABLE {table_name} DELETE WHERE toDate(assignment_result_doc_created_date) >= '{start_date_del}'"
         client_target.command(delete_query)
-        print(f"✅ Данные за последние {DAYS_TO_SYNC} дней удалены из {table_name}.")
+        _rlog(f"✅ Данные за последние {DAYS_TO_SYNC} дней удалены из {table_name}.")
         client_target.close()
         client_target = None
 
     except Exception as e:
         error_msg = f"❌ Ошибка при создании или очистке таблицы: {e}"
-        print(error_msg)
+        _rlog(error_msg)
         send_ntfy_alert(f"Ошибка подготовки БД: {str(e)[:80]}", title="DB Setup Error", priority="urgent", tags="database")
         if client_target:
             client_target.close()
@@ -295,8 +322,8 @@ def export_cometa_conclusions_summary():
             database=CH_DATABASE_SOURCE, secure=True, verify=False,
             send_receive_timeout=94200, connect_timeout=999999
         )
-        print("✅ Исходная ClickHouse подключена.")
-        
+        _rlog("✅ Исходная ClickHouse подключена.")
+
         # --- Шаг 3: Формируем запрос ---
         start_date_str = n_days_ago.strftime('%Y-%m-%d')
         end_date_str = today.strftime('%Y-%m-%d')
@@ -336,18 +363,18 @@ WHERE
     AND r.descr_result_conclusion  IS NOT NULL AND r.descr_result_conclusion  != ''
         """
         
-        print("📥 Выполняю запрос к исходной ClickHouse...")
+        _rlog("📥 Выполняю запрос к исходной ClickHouse...")
         result = client_source.query(base_query)
         raw_rows = result.result_rows
         column_names = result.column_names
-        
+
         client_source.close()
         client_source = None
-        print(f"📥 Получено {len(raw_rows)} строк данных.")
-        
+        _rlog(f"📥 Получено {len(raw_rows)} строк данных.")
+
         # Если данных нет
         if not raw_rows:
-            print(f"📭 Нет данных для синхронизации.")
+            _rlog("📭 Нет данных для синхронизации.")
             send_ntfy_alert(f"Нет данных для синхронизации Cometa New за {DAYS_TO_SYNC} дней", title="Cometa New Empty", priority="default", tags="inbox")
             disconnect_vpn()
             if client_target:
@@ -355,7 +382,7 @@ WHERE
             return True
         
         # --- Шаг 4: Создание и заполнение SQLite буфера ---
-        print(f"💾 Создаю SQLite буфер ({temp_db_name})...")
+        _rlog(f"💾 Создаю SQLite буфер ({temp_db_name})...")
         sqlite_conn = sqlite3.connect(temp_db_name)
         sqlite_cursor = sqlite_conn.cursor()
         sqlite_cursor.execute("DROP TABLE IF EXISTS temp_cometa_conclusions_summary_new_data;")
@@ -386,11 +413,11 @@ WHERE
         sqlite_cursor.executemany(insert_sql, raw_rows)
         sqlite_conn.commit()
         sqlite_conn.close()
-        print(f"✅ SQLite буфер заполнен.")
-        
+        _rlog("✅ SQLite буфер заполнен.")
+
     except Exception as e:
         error_msg = f"❌ Ошибка при работе с исходной ClickHouse или SQLite: {e}"
-        print(error_msg)
+        _rlog(error_msg)
         send_ntfy_alert(f"Сбой синхронизации: {str(e)[:80]}", title="Cometa New Sync Error", priority="urgent", tags="fire")
         if client_source:
             client_source.close()
@@ -500,14 +527,14 @@ WHERE
             processed_rows.append(processed_row)
         
         total = len(processed_rows)
-        print(f"📤 Загружаю {total} строк в {CH_DATABASE_TARGET}.{table_name} (батчи по {CHUNK_SIZE})...")
+        _rlog(f"📤 Загружаю {total} строк в {CH_DATABASE_TARGET}.{table_name} (батчи по {CHUNK_SIZE})...")
         for i in range(0, total, CHUNK_SIZE):
             chunk = processed_rows[i:i + CHUNK_SIZE]
             client_target.insert(table_name, chunk, column_names=processed_column_names)
             print(f"   Загружено {min(i + CHUNK_SIZE, total)}/{total} строк.")
 
         success_msg = f"✅ Синхронизировано {total} строк."
-        print(success_msg)
+        _rlog(success_msg)
         send_ntfy_alert(success_msg, title="Cometa New Sync Success", priority="high", tags="white_check_mark")
         
         client_target.close()
@@ -524,7 +551,7 @@ WHERE
         
     except Exception as e:
         error_msg = f"❌ Ошибка выгрузки в целевую ClickHouse: {e}"
-        print(error_msg)
+        _rlog(error_msg)
         send_ntfy_alert(f"Ошибка выгрузки: {str(e)[:80]}", title="Cometa New Insert Error", priority="urgent", tags="database")
         if client_target:
             client_target.close()
@@ -538,37 +565,38 @@ WHERE
 
 # === Основная точка входа ===
 def main():
-    """Основная функция"""
-    print(f"🚀 Запуск синхронизации cometa_conclusions_summary_new (последние {DAYS_TO_SYNC} дней)")
+    global _run_log
+    _run_log = []
+    _start = datetime.now()
+
+    _rlog(f"🚀 Запуск синхронизации cometa_conclusions_summary_new (последние {DAYS_TO_SYNC} дней)")
     send_ntfy_alert(
         f"Запускаю синхронизацию Cometa New за {DAYS_TO_SYNC} дней...",
-        title="Dashbord Start",
-        priority="default",
-        tags="robot"
+        title="Dashbord Start", priority="default", tags="robot",
     )
-    
+
     success = export_cometa_conclusions_summary()
-    
-    # Финальные уведомления
+
+    now_str = _start.strftime("%d.%m.%Y")
+    dur_str = str(datetime.now() - _start).split('.')[0]
+
     if success:
-        send_ntfy_alert(
-            f"✅ Данные для АРИ выгружены успешно!",
-            title="Dashbord Done",
-            priority="high",
-            tags="tada",
-            topic_override="push_mrc_dashboards_7895"  # ← указываем топик напрямую
-        )
-        print("🏁 Синхронизация завершена успешно.")
+        send_ntfy_alert("✅ Данные для АРИ выгружены успешно!",
+                        title="Dashbord Done", priority="high", tags="tada",
+                        topic_override="push_mrc_dashboards_7895")
+        _rlog("🏁 Синхронизация завершена успешно.")
+        bx_status = "  ✅  cometa_conclusions_summary_new"
     else:
-        send_ntfy_alert(
-            "❌ Данные для АРИ выгружены  с ошибкой! Проверьте консоль.",
-            title="Dashbord Failed",
-            priority="urgent",
-            tags="warning",
-            topic_override="push_mrc_dashboards_7895"  # ← указываем топик напрямую
-        )
-        print("❌ Синхронизация завершена с ошибками.")
-    
+        send_ntfy_alert("❌ Данные для АРИ выгружены с ошибкой! Проверьте консоль.",
+                        title="Dashbord Failed", priority="urgent", tags="warning",
+                        topic_override="push_mrc_dashboards_7895")
+        _rlog("❌ Синхронизация завершена с ошибками.")
+        bx_status = "  ❌  cometa_conclusions_summary_new"
+
+    _bx_send(_BX_LOG_DIALOG, f"[ари_up] {now_str} | {dur_str}\n\n" + "\n".join(_run_log))
+    _bx_send(_BX_SUMMARY_DIALOG,
+             f"[B]ари_up[/B]  {now_str}\nВремя: {dur_str}\n\n{bx_status}")
+
     return success
 
 

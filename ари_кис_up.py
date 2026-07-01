@@ -14,12 +14,37 @@ import time
 import sys
 import os
 import sqlite3
+import requests
 import clickhouse_connect
 from datetime import datetime, timedelta
 import datetime as datetime_module
 
 from ntfy_notifier import send_ntfy_alert
 import personal_config2 as cfg
+
+# === Битрикс24 ===
+BITRIX_WEBHOOK     = cfg.BITRIX_WEBHOOK
+_BX_LOG_DIALOG     = "chat145691"
+_BX_SUMMARY_DIALOG = "chat145721"
+
+_run_log: list = []
+
+
+def _rlog(msg: str) -> None:
+    print(msg)
+    _run_log.append(msg)
+
+
+def _bx_send(dialog_id: str, text: str) -> None:
+    url = f"{BITRIX_WEBHOOK.rstrip('/')}/im.message.add.json"
+    chunks = [text[i:i + 3900] for i in range(0, max(len(text), 1), 3900)]
+    for chunk in chunks:
+        try:
+            resp = requests.post(url, json={"DIALOG_ID": dialog_id, "MESSAGE": chunk}, timeout=30)
+            if not resp.ok:
+                print(f"⚠️ Битрикс [{dialog_id}] {resp.status_code}: {resp.text[:200]}")
+        except Exception as e:
+            print(f"⚠️ Битрикс [{dialog_id}]: {e}")
 
 # === Настройки синхронизации (плавающие даты) ===
 DAYS_TO_SYNC = 6
@@ -79,14 +104,14 @@ def setup_sqlite_adapters():
 
 # === VPN ===
 def connect_vpn():
-    print("Запускаю TrGUI...")
+    _rlog("Запускаю TrGUI...")
     send_ntfy_alert("Запускаю VPN для ari_kis...", title="VPN Connect", priority="default", tags="lock")
     try:
         process = subprocess.Popen(VPN_APP_PATH)
-        print(f"   PID: {process.pid}")
+        _rlog(f"   PID: {process.pid}")
     except Exception as e:
         msg = f"Ошибка запуска VPN: {e}"
-        print(msg)
+        _rlog(msg)
         send_ntfy_alert(msg, title="VPN Error", priority="urgent", tags="warning")
         raise
     time.sleep(15)
@@ -96,7 +121,7 @@ def connect_vpn():
             try:
                 window.activate()
                 time.sleep(2)
-                print(f"Окно '{window.title}' активировано.")
+                _rlog(f"Окно '{window.title}' активировано.")
                 break
             except Exception:
                 pass
@@ -115,12 +140,12 @@ def connect_vpn():
     time.sleep(1)
     pyautogui.click(CONNECT_BUTTON_X, CONNECT_BUTTON_Y)
     time.sleep(15)
-    print("VPN подключён.")
+    _rlog("VPN подключён.")
     send_ntfy_alert("VPN подключён", title="VPN Connected", priority="high", tags="key")
 
 
 def disconnect_vpn():
-    print("Отключаю VPN...")
+    _rlog("Отключаю VPN...")
     send_ntfy_alert("Отключаюсь от VPN...", title="VPN Disconnect", priority="default", tags="unlock")
     pyautogui.rightClick(RIGHT_CLICK_MENU_X, RIGHT_CLICK_MENU_Y)
     time.sleep(2)
@@ -128,7 +153,7 @@ def disconnect_vpn():
     time.sleep(3)
     pyautogui.click(CONFIRMATION_CLICK_X, CONFIRMATION_CLICK_Y)
     time.sleep(3)
-    print("VPN отключён.")
+    _rlog("VPN отключён.")
     send_ntfy_alert("VPN отключён", title="VPN Disconnected", priority="default", tags="check")
 
 
@@ -380,7 +405,7 @@ def sync_ari_kis(days: int) -> bool:
     today      = datetime.now().date()
     n_days_ago = (today - timedelta(days=days)).isoformat()
 
-    print(f"[ari_kis] Синхронизация за последние {days} дней (с {n_days_ago}).")
+    _rlog(f"[ari_kis] Синхронизация за последние {days} дней (с {n_days_ago}).")
     send_ntfy_alert(
         f"Начинаю синхронизацию ari_kis за {days} дней...",
         title="ari_kis Start", priority="default", tags="inbox",
@@ -431,10 +456,10 @@ def sync_ari_kis(days: int) -> bool:
         raw_rows = result.result_rows
         client_source.close()
         client_source = None
-        print(f"Получено {len(raw_rows)} строк.")
+        _rlog(f"Получено {len(raw_rows)} строк.")
 
         if not raw_rows:
-            print(f"Нет данных за последние {days} дней.")
+            _rlog(f"Нет данных за последние {days} дней.")
             send_ntfy_alert(f"Нет данных ari_kis за {days} дней",
                             title="ari_kis Empty", priority="default", tags="inbox")
             disconnect_vpn()
@@ -548,7 +573,7 @@ def sync_ari_kis(days: int) -> bool:
             print(f"   Загружено {min(i + CHUNK_SIZE, total)}/{total} строк.")
 
         msg = f"[ari_kis] Синхронизировано {total} строк за {days} дней."
-        print(msg)
+        _rlog(msg)
         send_ntfy_alert(msg, title="ari_kis Success", priority="high", tags="white_check_mark")
 
         client_target.close()
@@ -575,8 +600,12 @@ def sync_ari_kis(days: int) -> bool:
 
 
 def main():
+    global _run_log
+    _run_log = []
+    _start = datetime.now()
     days = DAYS_TO_SYNC
-    print(f"Запуск ари_кис_up (последние {days} дней)")
+
+    _rlog(f"Запуск ари_кис_up (последние {days} дней)")
     send_ntfy_alert(
         f"Запускаю ари_кис_up за {days} дней...",
         title="ari_kis Start", priority="default", tags="robot",
@@ -584,20 +613,29 @@ def main():
 
     success = sync_ari_kis(days)
 
+    now_str = _start.strftime("%d.%m.%Y")
+    dur_str = str(datetime.now() - _start).split('.')[0]
+
     if success:
         send_ntfy_alert(
             f"Данные АРИ КИС выгружены успешно! ({days} дней)",
             title="ari_kis Done", priority="high", tags="tada",
             topic_override="push_mrc_dashboards_7895",
         )
-        print("Синхронизация завершена успешно.")
+        _rlog("Синхронизация завершена успешно.")
+        bx_status = "  ✅  ari_kis"
     else:
         send_ntfy_alert(
             "Данные АРИ КИС выгружены с ошибкой! Проверьте консоль.",
             title="ari_kis Failed", priority="urgent", tags="warning",
             topic_override="push_mrc_dashboards_7895",
         )
-        print("Синхронизация завершена с ошибками.")
+        _rlog("Синхронизация завершена с ошибками.")
+        bx_status = "  ❌  ari_kis"
+
+    _bx_send(_BX_LOG_DIALOG, f"[ари_кис_up] {now_str} | {dur_str}\n\n" + "\n".join(_run_log))
+    _bx_send(_BX_SUMMARY_DIALOG,
+             f"[B]ари_кис_up[/B]  {now_str}\nВремя: {dur_str}\n\n{bx_status}")
 
     return success
 

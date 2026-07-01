@@ -225,7 +225,7 @@ def export_validation_eris_report():
                 any(JSONExtractInt(JSONExtractString(raw_data, 'aiResult'), 'modelId')) AS modelId
             FROM dwh_views.v_eris_report
             WHERE app_source = 'CDS'
-                AND parseDateTimeBestEffort(JSONExtractString(computed_data, 'pumStudyReadyForAiTime')) IS NOT NULL
+                AND parseDateTimeBestEffortOrNull(JSONExtractString(computed_data, 'pumStudyReadyForAiTime')) IS NOT NULL
                 GROUP BY studyIUID
             ) as eris_rep
             ON vie.study_uid = eris_rep.studyIUID
@@ -407,7 +407,7 @@ def extract_phase():
                 any(JSONExtractInt(JSONExtractString(raw_data, 'aiResult'), 'modelId')) AS modelId
             FROM dwh_views.v_eris_report
             WHERE app_source = 'CDS'
-                AND parseDateTimeBestEffort(JSONExtractString(computed_data, 'pumStudyReadyForAiTime')) IS NOT NULL
+                AND parseDateTimeBestEffortOrNull(JSONExtractString(computed_data, 'pumStudyReadyForAiTime')) IS NOT NULL
                 GROUP BY studyIUID
             ) as eris_rep
             ON vie.study_uid = eris_rep.studyIUID

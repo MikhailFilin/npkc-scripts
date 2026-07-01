@@ -10,21 +10,22 @@ VPN подключается ОДИН РАЗ, все запросы выполн
   4.  instrumental_3w_up    → instrumental_examinations_3w       (Target CH)  [новый не_описанные]
   5.  ии1_up                → validation_ai_results              (PostgreSQL)
   6.  ии2_up                → validation_eris_report             (PostgreSQL)
-  7.  validation_summary    → validation_summary (3 таблицы)     (Target CH)
-  8.  conclusion_komet_up   → cometa_conclusions_summary         (Target CH)
-  9.  concl_click_up        → instrumental_summary               (Target CH)
-  10. concl_npkc_up         → instrumental_summary_npkc          (Target CH)
-  11. caop_export_up        → count_caop                         (PostgreSQL)
-  12. описания_не_нпкц     → assignment_results_other_mo        (Target CH)
-  13. загрузка_амб_дни     → workload_komet_day                (PostgreSQL)
-  14. загрузка_амб_месяц   → workload_komet_month              (PostgreSQL)
-  15. загрузка_амб_неделя  → workload_komet_week               (PostgreSQL)
-  16. vitrina_sync          → v_task_pin, v_undescribed + матвью (PostgreSQL)
-  17. kis_eris_up           → kis_eris                         (Target CH)
-  18. oko_saurona_up        → overdue_studies_monitoring        (Target CH)
+  7.  conclusion_komet_up   → cometa_conclusions_summary         (Target CH)
+  8.  concl_click_up        → instrumental_summary               (Target CH)
+  9.  concl_npkc_up         → instrumental_summary_npkc          (Target CH)
+  10. caop_export_up        → count_caop                         (PostgreSQL)
+  11. описания_не_нпкц     → assignment_results_other_mo        (Target CH)
+  12. загрузка_амб_дни     → workload_komet_day                (PostgreSQL)
+  13. загрузка_амб_месяц   → workload_komet_month              (PostgreSQL)
+  14. загрузка_амб_неделя  → workload_komet_week               (PostgreSQL)
+  15. vitrina_sync          → v_task_pin, v_undescribed + матвью (PostgreSQL)
+  16. kis_eris_up           → kis_eris                         (Target CH)
+  17. oko_saurona_up        → overdue_studies_monitoring        (Target CH)
+  18. guide_dismissed_up    → guide_doctors_dismissal_v2        (Target CH, без VPN)
 
 Исключён (старый скрипт):
-  не_описанные_up.py  → instrumental_examinations_queue_v3  (заменён на instrumental_3w_up)
+  не_описанные_up.py          → instrumental_examinations_queue_v3  (заменён на instrumental_3w_up)
+  validation_summary_expor.py → validation_summary (3 таблицы)      (заменён на concl_click_up.py)
 """
 
 import os
@@ -38,10 +39,89 @@ import importlib.util
 import traceback
 
 import pyautogui
+import requests
 from datetime import datetime, timedelta
 
 from ntfy_notifier import send_ntfy_alert
 import personal_config as cfg
+
+# === Битрикс24 ===
+_BITRIX_WEBHOOK    = cfg.BITRIX_WEBHOOK
+_BX_LOG_DIALOG     = "chat145691"   # детальный итог по задачам
+_BX_SUMMARY_DIALOG = "chat145721"   # одна строка-сводка
+
+# Дашборды: ключ совпадает с ключами extract_results / load_results
+_DASHBOARD_URLS = {
+    'стади / instrumental_examinations':
+        ('Медицина_ДКЦЛД — Кол-во исследований',
+         'https://datalens.ru/0vu92i4d9co0k-medicina-dkcld-analitika?tab=BW4'),
+    'расхождение_ии / ai_norma_comparing':
+        ('Медицина_ДКЦЛД — Расхождение ИИ и Врача',
+         'https://datalens.ru/0vu92i4d9co0k-medicina-dkcld-analitika?tab=Oeg'),
+    'рабочие_списки / v_instrumental_task_lists':
+        ('Медицина_ДКЦЛД — Рабочие списки врачей',
+         'https://datalens.ru/7n8p0x71xmuur-medicina-dkcld-rabochie-spiski-vrachey'),
+    'инстр_3w / instrumental_examinations_3w':
+        ('Медицина_ДКЦЛД — Не описанные исследования',
+         'https://datalens.ru/4p1hmidf0tc8o-medicina-dkcld-ne-opisannye-issledovaniya'),
+    'ии1 / validation_ai_results':
+        ('Медицина_ИИ — Поток исследований',
+         'https://datalens.ru/s8tathzr83tgc-medicina-ii-potok-issledovaniy'),
+    'ии2 / validation_eris_report':
+        ('Медицина_ИИ — Поток исследований',
+         'https://datalens.ru/s8tathzr83tgc-medicina-ii-potok-issledovaniy'),
+    'conclusion_komet / cometa_conclusions_summary':
+        ('—', ''),
+    'concl_click / instrumental_summary':
+        ('Медицина_ДКЦЛД — 24 часа / Аналитический уровень',
+         'https://datalens.ru/0vu92i4d9co0k-medicina-dkcld-analitika'),
+    'concl_npkc / instrumental_summary_npkc':
+        ('Медицина_Общие — Поток исследований',
+         'https://datalens.ru/zic343hcd77kk-medicina-obshie-potok-issledovaniy'),
+    'caop / count_caop':
+        ('Медицина_ДКЦЛД — ЦАОП',
+         'https://datalens.ru/0vu92i4d9co0k-medicina-dkcld-analitika?tab=X9K'),
+    'описания_не_нпкц / assignment_results_other_mo':
+        ('Медицина_ДКЦЛД — Аналитический уровень',
+         'https://datalens.ru/0vu92i4d9co0k-medicina-dkcld-analitika?tab=w1'),
+    'загрузка_амб_дни / workload_komet_day':
+        ('Публичный — Загрузка оборудования',
+         'https://datalens.ru/0y0bcncz4wh8k-publichnyy-zagruzka-oborudovaniya-agfa-amb-eris-kis-er'),
+    'загрузка_амб_месяц / workload_komet_month':
+        ('Публичный — Загрузка оборудования',
+         'https://datalens.ru/0y0bcncz4wh8k-publichnyy-zagruzka-oborudovaniya-agfa-amb-eris-kis-er'),
+    'загрузка_амб_неделя / workload_komet_week':
+        ('Публичный — Загрузка оборудования',
+         'https://datalens.ru/0y0bcncz4wh8k-publichnyy-zagruzka-oborudovaniya-agfa-amb-eris-kis-er'),
+    'vitrina_sync / v_task_pin + v_undescribed':
+        ('Публичный — Рейтинг МО (Пин) / Аудит Дефектура',
+         'https://datalens.ru/uawp3bzpyjese-publichnyy-reyting-mopin'),
+    'кис_врачи / kis_workload_doc':
+        ('—', ''),
+    'kis_eris / kis_eris':
+        ('Медицина_Общие — Стационарные исследования',
+         'https://datalens.ru/k35ptvlvixue5-medicina-obshie-stacionarnye-issledovaniya'),
+    'oko_saurona / overdue_studies_monitoring':
+        ('Медицина — Контроль отложенных исследований',
+         'https://datalens.ru/izpccvuv9vrk2-medicina-kontrol-otlozhennyh-issledovaniy'),
+    'guide_dismissed / guide_doctors_dismissal_v2':
+        ('—', ''),
+    'appeals / feedback_2026':
+        ('—', ''),
+}
+
+
+def _bx_send(dialog_id: str, text: str) -> None:
+    """Отправляет сообщение в чат Битрикс24 с чанкованием по 3900 символов."""
+    url    = f"{_BITRIX_WEBHOOK.rstrip('/')}/im.message.add.json"
+    chunks = [text[i:i + 3900] for i in range(0, max(len(text), 1), 3900)]
+    for chunk in chunks:
+        try:
+            resp = requests.post(url, json={"DIALOG_ID": dialog_id, "MESSAGE": chunk}, timeout=30)
+            if not resp.ok:
+                print(f"⚠️ Битрикс [{dialog_id}] {resp.status_code}: {resp.text[:200]}")
+        except Exception as e:
+            print(f"⚠️ Битрикс [{dialog_id}]: {e}")
 
 
 class _Tee:
@@ -129,9 +209,6 @@ DAYS_ИИ1              = 4    # ии1_up:               validation_ai_results (
 DAYS_ИИ2              = 4    # ии2_up:               validation_eris_report (PostgreSQL)
                               #   берёт conduct_date за последние N дней
 
-DAYS_VAL_SUMMARY      = 15   # validation_summary:   validation_summary* (3 таблицы, Target CH)
-                              #   удаляет и перегружает данные за последние N дней
-
 DAYS_KOMET            = 15   # conclusion_komet_up:  cometa_conclusions_summary (Target CH)
                               #   удаляет и перегружает данные за последние N дней
 
@@ -149,7 +226,10 @@ DAYS_КИС_ЕРИС         = 20   # kis_eris_up:           kis_eris (Target CH
 DAYS_КИС_ВРАЧИ        = 30  # кис_загрузка_врачей:   kis_workload_doc (Target CH)
                               #   удаляет и перегружает данные за последние N дней
 
-DAYS_ОКО_САУРОНА      = 20   # oko_saurona_up:        overdue_studies_monitoring (Target CH)
+DAYS_ОКО_САУРОНА      = 20   # oko_saurona_up:        overdue_studies_monitoring
+
+DAYS_АИ_ЮЗИНГ         = 3    # ai_using_up:           ai_using_studies (Target CH)
+                              #   ReplacingMergeTree: вставляет поверх, дубли схлопываются (Target CH)
                               #   удаляет и перегружает данные за последние N дней
 
 # Примечания:
@@ -362,7 +442,6 @@ _modules_map = {
     'инстр_3w':    'instrumental_3w_up.py',
     'ии1':         'ии1_up.py',
     'ии2':         'ии2_up.py',
-    'val_sum':     'validation_summary_expor.py',
     'komet':       'conclusion_komet_up.py',
     'concl':       'concl_click_up.py',
     'concl_npkc':  'concl_npkc_up.py',
@@ -375,6 +454,9 @@ _modules_map = {
     'kis_eris':       'kis_eris_up.py',
     'кис_врачи':      'кис_загрузка_врачей.py',
     'oko_saurona':    'oko_saurona_up.py',
+    'ai_using':       'ai_using_up.py',
+    'guide_dismissed':'guide_dismissed_up.py',
+    'appeals':        'export_appeals.py',
 }
 
 _mods = {}
@@ -397,7 +479,6 @@ if _mods['стади']:    _mods['стади'].DAYS_TO_SYNC    = DAYS_СТАДИ
 if _mods['рабочие']:  _mods['рабочие'].DAYS_TO_SYNC  = DAYS_РАБОЧИЕ
 if _mods['ии1']:      _mods['ии1'].DAYS_TO_SYNC      = DAYS_ИИ1
 if _mods['ии2']:      _mods['ии2'].DAYS_TO_SYNC      = DAYS_ИИ2
-if _mods['val_sum']:  _mods['val_sum'].DAYS_TO_SYNC  = DAYS_VAL_SUMMARY
 if _mods['komet']:    _mods['komet'].DAYS_TO_SYNC    = DAYS_KOMET
 if _mods['concl']:      _mods['concl'].DAYS_TO_SYNC      = DAYS_CONCL_CLICK
 if _mods['concl_npkc']: _mods['concl_npkc'].DAYS_TO_SYNC = DAYS_CONCL_NPKC
@@ -405,10 +486,7 @@ if _mods['описания']:  _mods['описания'].DAYS_TO_SYNC  = DAYS_О
 if _mods['kis_eris']:   _mods['kis_eris'].DAYS_TO_SYNC   = DAYS_КИС_ЕРИС
 if _mods['кис_врачи']:    _mods['кис_врачи'].DAYS_TO_SYNC    = DAYS_КИС_ВРАЧИ
 if _mods['oko_saurona']: _mods['oko_saurona'].DAYS_TO_SYNC = DAYS_ОКО_САУРОНА
-
-# Для validation_summary SQLITE_DB: заменяем путь на локальный (был C:\Users\m.filin\...)
-if _mods['val_sum'] is not None:
-    _mods['val_sum'].SQLITE_DB = os.path.join(SCRIPTS_DIR, 'temp_val_summary_buffer.db')
+if _mods['ai_using']:    _mods['ai_using'].DAYS_TO_SYNC    = DAYS_АИ_ЮЗИНГ
 
 print("📦 Все модули загружены.\n")
 
@@ -416,6 +494,15 @@ print("📦 Все модули загружены.\n")
 # ===========================================================================
 # Вспомогательная обёртка выполнения задачи
 # ===========================================================================
+
+def _call_guide_dismissed(mod):
+    """guide_dismissed_up.main() делает sys.exit(1) при ошибке — гасим это, чтобы не уронить весь скрипт."""
+    try:
+        mod.main()
+        return True
+    except SystemExit:
+        return False
+
 
 def _run_task(name, func):
     print(f"\n{'='*60}")
@@ -457,7 +544,6 @@ def main():
     )
 
     m = _mods
-    _date_from_val = (datetime.now() - timedelta(days=DAYS_VAL_SUMMARY)).strftime('%Y-%m-%d')
 
     # -----------------------------------------------------------------------
     # ФАЗА 1: VPN включён — извлекаем данные из source ClickHouse в буферы
@@ -499,10 +585,6 @@ def main():
     if m['ии2']:
         extract_results['ии2 / validation_eris_report'] = \
             _run_task("ии2 [extract]", lambda: m['ии2'].extract_phase())
-
-    if m['val_sum']:
-        extract_results['validation_summary (3 таблицы)'] = \
-            _run_task("val_sum [extract]", lambda: m['val_sum'].extract_and_buffer_data(_date_from_val))
 
     if m['komet']:
         extract_results['conclusion_komet / cometa_conclusions_summary'] = \
@@ -552,6 +634,10 @@ def main():
         extract_results['oko_saurona / overdue_studies_monitoring'] = \
             _run_task("oko_saurona [extract]", lambda: m['oko_saurona'].extract_phase())
 
+    if m['ai_using']:
+        extract_results['ai_using / ai_using_studies'] = \
+            _run_task("ai_using [extract]", lambda: m['ai_using'].extract_phase())
+
     # -----------------------------------------------------------------------
     # Отключение VPN
     # -----------------------------------------------------------------------
@@ -595,10 +681,6 @@ def main():
     if m['ии2'] and extract_results.get('ии2 / validation_eris_report'):
         load_results['ии2 / validation_eris_report'] = \
             _run_task("ии2 [load]", lambda: m['ии2'].load_phase())
-
-    if m['val_sum'] and extract_results.get('validation_summary (3 таблицы)'):
-        load_results['validation_summary (3 таблицы)'] = \
-            _run_task("val_sum [load]", lambda: m['val_sum'].load_buffer_to_clickhouse(_date_from_val))
 
     if m['komet'] and extract_results.get('conclusion_komet / cometa_conclusions_summary'):
         load_results['conclusion_komet / cometa_conclusions_summary'] = \
@@ -648,6 +730,22 @@ def main():
         load_results['oko_saurona / overdue_studies_monitoring'] = \
             _run_task("oko_saurona [load]", lambda: m['oko_saurona'].load_phase())
 
+    if m['ai_using'] and extract_results.get('ai_using / ai_using_studies'):
+        load_results['ai_using / ai_using_studies'] = \
+            _run_task("ai_using [load]", lambda: m['ai_using'].load_phase())
+
+    if m['guide_dismissed']:
+        # Не требует VPN (Bitrix24 API + target CH) — выполняется целиком здесь
+        ok = _run_task("guide_dismissed", lambda: _call_guide_dismissed(m['guide_dismissed']))
+        extract_results['guide_dismissed / guide_doctors_dismissal_v2'] = True
+        load_results['guide_dismissed / guide_doctors_dismissal_v2'] = ok
+
+    if m['appeals']:
+        # Не требует VPN (Bitrix24 API публичен, PostgreSQL в Yandex Cloud без VPN)
+        ok = _run_task("appeals [export → PG]", lambda: m['appeals'].main())
+        extract_results['appeals / feedback_2026'] = True
+        load_results['appeals / feedback_2026'] = ok
+
     # -----------------------------------------------------------------------
     # Итог
     # -----------------------------------------------------------------------
@@ -690,6 +788,52 @@ def main():
         _send_ntfy_chunked(msg, title=f"Export: {len(failed_tasks)} errors of {len(results)}",
                            priority="urgent", tags="warning",
                            topic_override="push_mrc_dashboards_7895")
+
+    # --- Битрикс24 ---
+    now_str = start_time.strftime("%d.%m.%Y")
+    dur_str = str(duration).split('.')[0]
+
+    # chat145691: полный лог из файла (все print()-выводы всех задач)
+    try:
+        _log_file.flush()
+        with open(_log_path, encoding='utf-8') as _lf:
+            full_log_text = _lf.read()
+        bx_full_msg = f"[all_dashboards] {now_str} | ⏱ {dur_str}\n\n" + full_log_text
+    except Exception as _e:
+        bx_full_msg = f"[all_dashboards] {now_str} | ⏱ {dur_str}\n(лог недоступен: {_e})"
+
+    # chat145721: структурированный отчёт с BB-кодами Битрикс24
+    bx_sum_lines = [
+        f"[B]Единый экспорт дашбордов[/B]  {now_str}",
+        f"Время выполнения: {dur_str}",
+        "",
+    ]
+    if ok_tasks:
+        bx_sum_lines.append(f"[B]✅ Успешно ({len(ok_tasks)}/{len(results)}):[/B]")
+        for t in ok_tasks:
+            dash_name, dash_url = _DASHBOARD_URLS.get(t, ('', ''))
+            bx_sum_lines.append(f"  ✅  {t}")
+            if dash_name and dash_name != '—':
+                if dash_url:
+                    bx_sum_lines.append(f"       [B][URL={dash_url}]{dash_name}[/URL][/B]")
+                else:
+                    bx_sum_lines.append(f"       [B]{dash_name}[/B]")
+    if failed_tasks:
+        bx_sum_lines.append("")
+        bx_sum_lines.append(f"[B]❌ С ошибкой ({len(failed_tasks)}/{len(results)}):[/B]")
+        for t in failed_tasks:
+            dash_name, dash_url = _DASHBOARD_URLS.get(t, ('', ''))
+            bx_sum_lines.append(f"  ❌  {t}")
+            if dash_name and dash_name != '—':
+                if dash_url:
+                    bx_sum_lines.append(f"       [B][URL={dash_url}]{dash_name}[/URL][/B]")
+                else:
+                    bx_sum_lines.append(f"       [B]{dash_name}[/B]")
+    bx_summary = "\n".join(bx_sum_lines)
+
+    _bx_send(_BX_LOG_DIALOG, bx_full_msg)
+    _bx_send(_BX_SUMMARY_DIALOG, bx_summary)
+    # ---
 
     # Удаляем lock-файл
     try:

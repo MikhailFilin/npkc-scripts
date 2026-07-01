@@ -1,13 +1,13 @@
 """
 kis_eris_up.py
 Синхронизация данных kis_eris из ClickHouse (via VPN) в целевую ClickHouse (dwh_test_db).
-Таблицы источника: kis.eris, kis.instrumental, dm_ap2.dct_lpu
+Таблицы источника: kis.eris, kis.instrumental, kis.facility
 Таблица назначения: dwh_test_db.kis_eris (создаётся автоматически)
 
 Запуск: python kis_eris_up.py
   Количество дней задаётся константой DAYS_TO_SYNC в начале файла.
 
-# INPUT:  kis.eris, kis.instrumental, dm_ap2.dct_lpu (source CH, через VPN)
+# INPUT:  kis.eris, kis.instrumental, kis.facility (source CH, через VPN)
 # OUTPUT: kis_eris (target CH, dwh_test_db, Yandex Cloud)
 """
 
@@ -56,7 +56,7 @@ _SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 _BUFFER_PATH = os.path.join(_SCRIPTS_DIR, 'temp_buffer_kis_eris.db')
 
 _COLUMNS = [
-    'date_dt', 'date_time', 'facility_id', 'lpu_short_name', 'main_lpu_short_name',
+    'date_dt', 'date_time', 'facility_id', 'facility_short_name',
     'device_type', 'ae_title', 'procedure_code', 'procedure_name',
     'patient_id', 'naz_accession_number', 'study_uid', 'pay_type_name', 'sign_emp_id',
 ]
@@ -138,8 +138,7 @@ def _ensure_table_exists(client) -> None:
             date_dt               Date,
             date_time             DateTime64(3, 'UTC'),
             facility_id           String,
-            lpu_short_name        String,
-            main_lpu_short_name   String,
+            facility_short_name   String,
             device_type           String,
             ae_title              String,
             procedure_code        String,
@@ -163,8 +162,7 @@ SELECT
     toDate(i.sign_dt)                        AS date_dt,
     toDateTime64(i.sign_dt, 3, 'UTC')        AS date_time,
     e2.facility_id                           AS facility_id,
-    dl.lpu_short_name                        AS lpu_short_name,
-    dl.main_lpu_short_name                   AS main_lpu_short_name,
+    f.short_name                             AS facility_short_name,
     e2.device_type                           AS device_type,
     e2.ae_title                              AS ae_title,
     e2.naz_code                              AS procedure_code,
@@ -177,8 +175,8 @@ SELECT
 FROM kis.eris e2
 LEFT JOIN kis.instrumental i
     ON e2.naz_id = i.naz_id
-LEFT JOIN dm_ap2.dct_lpu dl
-    ON e2.facility_id = dl.lpu_id
+LEFT JOIN kis.facility f
+    ON e2.facility_id = f.id
 WHERE e2.studyuid IS NOT NULL
   AND i.sign_dt >= '{n_days_ago}'
 """
@@ -305,8 +303,7 @@ def sync_kis_eris(days: int) -> bool:
                 date_dt               TEXT,
                 date_time             TEXT,
                 facility_id           TEXT,
-                lpu_short_name        TEXT,
-                main_lpu_short_name   TEXT,
+                facility_short_name   TEXT,
                 device_type           TEXT,
                 ae_title              TEXT,
                 procedure_code        TEXT,
@@ -443,8 +440,7 @@ def extract_phase() -> bool:
                 date_dt               TEXT,
                 date_time             TEXT,
                 facility_id           TEXT,
-                lpu_short_name        TEXT,
-                main_lpu_short_name   TEXT,
+                facility_short_name   TEXT,
                 device_type           TEXT,
                 ae_title              TEXT,
                 procedure_code        TEXT,
