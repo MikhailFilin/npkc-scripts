@@ -38,7 +38,11 @@ CH_DATABASE_SOURCE = cfg.CH_DATABASE
 # === Настройки синхронизации (плавающие даты) ===
 DAYS_TO_SYNC = 100
 
-_BUFFER_CONCL = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'temp_buffer_summary.db')
+_SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
+_BUFFER_CONCL = os.path.join(
+    _SCRIPTS_DIR,
+    f'temp_buffer_summary_{datetime.now().strftime("%Y%m%d_%H%M%S_%f")}_{os.getpid()}.db'
+)
 _CONCL_COLUMNS = [
     'doc_date', 'assignment_result_emp_fio', 'payment_source', 'device_type', 'diagnostic_name',
     'assessment_result_type_code', 'conduct_mo_name', 'conduct_mu_name', 'conduct_district_name',
@@ -739,7 +743,48 @@ _SUMMARY_QUERY_BASE = (
                 diagnostic_ref_new.anatomical_areas
             ) AS anatomical_areas,
             ai_res.norma_value,
-            sum(coeff.total_coefficient) AS total_coefficient,
+            sum(
+                multiIf(
+                    toDate(toTimeZone(toDateTime(t2.assignment_result_doc_created_date), 'Europe/Moscow')) < '2026-06-01',
+                    (                CASE
+                    WHEN t2.diagnostic_code IN ('34', '33', '427') AND ai_res.norma_value = '1' THEN 0.3
+                    WHEN diagnostic_ref_old.service_type = 'КТ с КУ 1 зона' THEN 30.41
+                    WHEN diagnostic_ref_old.service_type = 'КТ с КУ 2 и более зон' THEN 49.75
+                    WHEN diagnostic_ref_old.service_type = 'КТ 1 зона' THEN 11.58
+                    WHEN diagnostic_ref_old.service_type = 'КТ 2 и более зон' THEN 11.58
+                    WHEN diagnostic_ref_old.service_type = 'МРТ 1 зона' THEN 15.06
+                    WHEN diagnostic_ref_old.service_type = 'МРТ 2 и более зон' THEN 15.06
+                    WHEN diagnostic_ref_old.service_type = 'МРТ с КУ 1 зона' THEN 34.71
+                    WHEN diagnostic_ref_old.service_type = 'МРТ с КУ 2 и более зон' THEN 60.25
+                    WHEN diagnostic_ref_old.service_type = 'ММГ' THEN 3.67
+                    WHEN diagnostic_ref_old.service_type = 'РГ' THEN 3.67
+                    WHEN diagnostic_ref_old.service_type = 'ФЛГ' THEN 1.0
+                    WHEN diagnostic_ref_old.service_type = 'Денс' THEN 2.15
+                    ELSE 1.0
+                END),
+                    (                CASE
+                    WHEN t2.diagnostic_code IN ('34', '33', '427') AND ai_res.norma_value = '1' THEN 0.3
+                    WHEN diagnostic_ref_new.service_type = 'КТ с КУ 1 зона' THEN 35.71
+                    WHEN diagnostic_ref_new.service_type = 'КТ с КУ 2 зоны' THEN 43.01
+                    WHEN diagnostic_ref_new.service_type = 'КТ с КУ 3 зоны' THEN 50.30
+                    WHEN diagnostic_ref_new.service_type = 'КТ 1 зона' THEN 14.59
+                    WHEN diagnostic_ref_new.service_type = 'КТ 2 зоны' THEN 21.88
+                    WHEN diagnostic_ref_new.service_type = 'КТ 3 зоны' THEN 29.17
+                    WHEN diagnostic_ref_new.service_type = 'КТ 4 зоны' THEN 36.47
+                    WHEN diagnostic_ref_new.service_type = 'МРТ 1 зона' THEN 17.22
+                    WHEN diagnostic_ref_new.service_type = 'МРТ 2 зоны' THEN 25.86
+                    WHEN diagnostic_ref_new.service_type = 'МРТ 3 зоны' THEN 34.44
+                    WHEN diagnostic_ref_new.service_type = 'МРТ с КУ 1 зона' THEN 39.92
+                    WHEN diagnostic_ref_new.service_type = 'МРТ с КУ 2 зоны' THEN 48.50
+                    WHEN diagnostic_ref_new.service_type = 'МРТ с КУ 3 зоны' THEN 57.14
+                    WHEN diagnostic_ref_new.service_type = 'ММГ' THEN 3.67
+                    WHEN diagnostic_ref_new.service_type = 'РГ' THEN 3.67
+                    WHEN diagnostic_ref_new.service_type = 'ФЛГ' THEN 1.0
+                    WHEN diagnostic_ref_new.service_type = 'Денс' THEN 2.15
+                    ELSE 1.0
+                END)
+                )
+            ) AS total_coefficient,
             multiIf(
                 ie.patient_age >= 18, 'Взрослые',
                 ie.patient_age < 18 AND ie.patient_age IS NOT NULL, 'Дети',
@@ -769,7 +814,19 @@ _SUMMARY_QUERY_BASE = (
             toString(t2.assignment_result_emp_id) AS assignment_result_emp_id,
             ai_res_2.has_defect_ab,
             0.0 AS tarif
-        FROM data_views.v_eris_assignment_results t2
+        FROM (
+            -- Дедупликация: одно исследование (accession_number) = одна строка = один тариф.
+            -- Убирает пересмотры (assessment_result_type_code = 3) и вторые коды услуг
+            -- (например 44+45 прямая/боковая проекции) на одном исследовании.
+            SELECT *
+            FROM data_views.v_eris_assignment_results
+            WHERE accession_number != ''
+              AND assessment_result_type_code != 3
+              AND toDate(toTimeZone(toDateTime(assignment_result_doc_created_date), 'Europe/Moscow')) >= '{date_from}'
+              AND toDate(toTimeZone(toDateTime(assignment_result_doc_created_date), 'Europe/Moscow')) <= '{date_to}'
+            ORDER BY assignment_result_doc_created_date, diagnostic_code
+            LIMIT 1 BY accession_number
+        ) t2
         LEFT JOIN (
             SELECT accession_number, any(patient_age) AS patient_age
             FROM data_views.v_instrumental_examinations
@@ -828,6 +885,7 @@ _SUMMARY_QUERY_BASE = (
                 )
             )
             WHERE defect_a = 1 OR defect_b = 1
+            GROUP BY studyIUID
         ) ai_res_2 ON t2.study_uid = ai_res_2.studyIUID
         LEFT JOIN (
             SELECT DISTINCT accession_number
@@ -844,66 +902,8 @@ _SUMMARY_QUERY_BASE = (
         ) pin_res ON t2.accession_number = pin_res.accession_number
         LEFT JOIN diagnostic_dict_old AS diagnostic_ref_old ON t2.diagnostic_code = diagnostic_ref_old.diagnostic_code
         LEFT JOIN diagnostic_dict_new AS diagnostic_ref_new ON t2.diagnostic_code = diagnostic_ref_new.diagnostic_code
-        LEFT JOIN (
-            SELECT t2.accession_number,
-                sum(
-                    multiIf(
-                        toDate(toTimeZone(toDateTime(t2.assignment_result_doc_created_date), 'Europe/Moscow')) < '2026-06-01',
-                        (                    CASE
-                        WHEN t2.diagnostic_code IN ('34', '33', '427') AND ai_res.norma_value = '1' THEN 0.3
-                        WHEN diagnostic_ref_old.service_type = 'КТ с КУ 1 зона' THEN 30.41
-                        WHEN diagnostic_ref_old.service_type = 'КТ с КУ 2 и более зон' THEN 49.75
-                        WHEN diagnostic_ref_old.service_type = 'КТ 1 зона' THEN 11.58
-                        WHEN diagnostic_ref_old.service_type = 'КТ 2 и более зон' THEN 11.58
-                        WHEN diagnostic_ref_old.service_type = 'МРТ 1 зона' THEN 15.06
-                        WHEN diagnostic_ref_old.service_type = 'МРТ 2 и более зон' THEN 15.06
-                        WHEN diagnostic_ref_old.service_type = 'МРТ с КУ 1 зона' THEN 34.71
-                        WHEN diagnostic_ref_old.service_type = 'МРТ с КУ 2 и более зон' THEN 60.25
-                        WHEN diagnostic_ref_old.service_type = 'ММГ' THEN 3.67
-                        WHEN diagnostic_ref_old.service_type = 'РГ' THEN 3.67
-                        WHEN diagnostic_ref_old.service_type = 'ФЛГ' THEN 1.0
-                        WHEN diagnostic_ref_old.service_type = 'Денс' THEN 2.15
-                        ELSE 1.0
-                    END),
-                        (                    CASE
-                        WHEN t2.diagnostic_code IN ('34', '33', '427') AND ai_res.norma_value = '1' THEN 0.3
-                        WHEN diagnostic_ref_new.service_type = 'КТ с КУ 1 зона' THEN 35.71
-                        WHEN diagnostic_ref_new.service_type = 'КТ с КУ 2 зоны' THEN 43.01
-                        WHEN diagnostic_ref_new.service_type = 'КТ с КУ 3 зоны' THEN 50.30
-                        WHEN diagnostic_ref_new.service_type = 'КТ 1 зона' THEN 14.59
-                        WHEN diagnostic_ref_new.service_type = 'КТ 2 зоны' THEN 21.88
-                        WHEN diagnostic_ref_new.service_type = 'КТ 3 зоны' THEN 29.17
-                        WHEN diagnostic_ref_new.service_type = 'КТ 4 зоны' THEN 36.47
-                        WHEN diagnostic_ref_new.service_type = 'МРТ 1 зона' THEN 17.22
-                        WHEN diagnostic_ref_new.service_type = 'МРТ 2 зоны' THEN 25.86
-                        WHEN diagnostic_ref_new.service_type = 'МРТ 3 зоны' THEN 34.44
-                        WHEN diagnostic_ref_new.service_type = 'МРТ с КУ 1 зона' THEN 39.92
-                        WHEN diagnostic_ref_new.service_type = 'МРТ с КУ 2 зоны' THEN 48.50
-                        WHEN diagnostic_ref_new.service_type = 'МРТ с КУ 3 зоны' THEN 57.14
-                        WHEN diagnostic_ref_new.service_type = 'ММГ' THEN 3.67
-                        WHEN diagnostic_ref_new.service_type = 'РГ' THEN 3.67
-                        WHEN diagnostic_ref_new.service_type = 'ФЛГ' THEN 1.0
-                        WHEN diagnostic_ref_new.service_type = 'Денс' THEN 2.15
-                        ELSE 1.0
-                    END)
-                    )
-                ) AS total_coefficient
-            FROM data_views.v_eris_assignment_results t2
-            LEFT JOIN (
-                SELECT JSONExtractString(raw_data, 'studyIUID') AS studyIUID,
-                    min(JSONExtractString(JSONExtractString(raw_data, 'aiResult'), 'norma')) AS norma_value
-                FROM dwh_views.v_eris_report
-                WHERE app_source = 'CDS'
-                AND parseDateTimeBestEffortOrNull(JSONExtractString(computed_data, 'pumStudyReadyForAiTime')) IS NOT NULL
-                AND JSONExtractString(raw_data, 'studyIUID') != ''
-                GROUP BY studyIUID
-            ) ai_res ON t2.study_uid = ai_res.studyIUID
-            LEFT JOIN diagnostic_dict_old AS diagnostic_ref_old ON t2.diagnostic_code = diagnostic_ref_old.diagnostic_code
-            LEFT JOIN diagnostic_dict_new AS diagnostic_ref_new ON t2.diagnostic_code = diagnostic_ref_new.diagnostic_code
-            WHERE t2.accession_number != ''
-            GROUP BY t2.accession_number
-        ) AS coeff ON t2.accession_number = coeff.accession_number
         WHERE t2.accession_number != ''
+          AND t2.assessment_result_type_code != 3
 """
 )
 
@@ -921,9 +921,10 @@ _SUMMARY_QUERY_TAIL = """
 
 
 def _build_summary_query(n_days_ago, today):
-    """Собирает единый SQL-запрос instrumental_summary (общий для export_instrumental_summary и extract_phase)."""
-    date_filter_clause = f"""  AND toDate(toTimeZone(toDateTime(t2.assignment_result_doc_created_date), 'Europe/Moscow')) >= '{n_days_ago.isoformat()}' AND toDate(toTimeZone(toDateTime(t2.assignment_result_doc_created_date), 'Europe/Moscow')) <= '{today.isoformat()}'"""
-    return _SUMMARY_QUERY_BASE + date_filter_clause + _SUMMARY_QUERY_TAIL
+    """Собирает единый SQL-запрос instrumental_summary (общий для export_instrumental_summary и extract_phase).
+    Фильтр по датам применяется внутри дедуп-подзапроса t2 через {date_from}/{date_to}."""
+    query = _SUMMARY_QUERY_BASE + _SUMMARY_QUERY_TAIL
+    return query.format(date_from=n_days_ago.isoformat(), date_to=today.isoformat())
 
 
 def export_instrumental_summary():
@@ -976,7 +977,10 @@ def export_instrumental_summary():
     
     # --- Шаг 2: Подключение к исходной базе через VPN ---
     client_source = None
-    temp_db_name = "temp_buffer_summary.db"
+    temp_db_name = os.path.join(
+        _SCRIPTS_DIR,
+        f'temp_buffer_summary_{datetime.now().strftime("%Y%m%d_%H%M%S_%f")}_{os.getpid()}.db'
+    )
     
     try:
         connect_vpn()
@@ -1361,6 +1365,13 @@ def load_phase():
         if client_target:
             client_target.close()
         return False
+    finally:
+        try:
+            if os.path.exists(_BUFFER_CONCL):
+                os.remove(_BUFFER_CONCL)
+                print(f"  🧹 [concl] load_phase: буфер {_BUFFER_CONCL} удалён.")
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
