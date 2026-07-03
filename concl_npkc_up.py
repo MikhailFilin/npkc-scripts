@@ -38,7 +38,7 @@ CH_PASSWORD_SOURCE = cfg.CH_PASSWORD
 CH_DATABASE_SOURCE = cfg.CH_DATABASE
 
 # === Синхронизация (плавающие даты) ===
-DAYS_TO_SYNC = 20
+DAYS_TO_SYNC = 30
 
 _SCRIPTS_DIR  = os.path.dirname(os.path.abspath(__file__))
 _BUFFER_PATH  = os.path.join(_SCRIPTS_DIR, 'temp_buffer_summary_npkc.db')

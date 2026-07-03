@@ -50,7 +50,7 @@ WITH studies AS (
       AND assignment_describe_start_date     IS NOT NULL
       AND assignment_result_doc_created_date IS NOT NULL
       AND accession_number                   IS NOT NULL
-      and assignment_result_emp_fio != 'Кивасёв С. А.' and assignment_result_emp_fio != 'Каспарьян Л. Г.' 
+      and assignment_result_emp_fio != 'Кивасёв С. А.' and assignment_result_emp_fio != 'Каспарьян Л. Г.'
     GROUP BY accession_number, diagnostic_code
     HAVING describe_end >= describe_start
        AND dateDiff('second', describe_start, describe_end) <= %(max_duration_seconds)s

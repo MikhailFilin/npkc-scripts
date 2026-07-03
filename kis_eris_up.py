@@ -17,6 +17,7 @@ import time
 import sys
 import os
 import sqlite3
+import traceback
 import clickhouse_connect
 from datetime import datetime, timedelta
 import datetime as datetime_module
@@ -25,7 +26,7 @@ from ntfy_notifier import send_ntfy_alert
 import personal_config as cfg
 
 # === Настройки синхронизации (плавающие даты) ===
-DAYS_TO_SYNC = 20
+DAYS_TO_SYNC = 400
 
 # === Настройки исходной ClickHouse ===
 CH_HOST_SOURCE     = cfg.CH_HOST
@@ -61,6 +62,29 @@ _COLUMNS = [
     'patient_id', 'naz_accession_number', 'study_uid', 'pay_type_name', 'sign_emp_id',
 ]
 
+_INSERT_BATCH_SIZE = 100_000
+
+
+def _stream_insert_from_sqlite(client, table_name: str, buffer_path: str, column_names: list,
+                                batch_size: int = _INSERT_BATCH_SIZE) -> int:
+    """Читает буфер из SQLite и вставляет в ClickHouse чанками, не загружая всё в память разом."""
+    conn   = sqlite3.connect(buffer_path)
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM temp_kis_eris;")
+    total = 0
+    try:
+        while True:
+            chunk = cursor.fetchmany(batch_size)
+            if not chunk:
+                break
+            processed_chunk = _process_rows(chunk)
+            client.insert(table_name, processed_chunk, column_names=column_names)
+            total += len(processed_chunk)
+            print(f"   Вставлено {total} строк...")
+    finally:
+        conn.close()
+    return total
+
 
 # === SQLite адаптеры ===
 def setup_sqlite_adapters():
@@ -83,7 +107,7 @@ def connect_vpn():
         process = subprocess.Popen(VPN_APP_PATH)
         print(f"   PID: {process.pid}")
     except Exception as e:
-        msg = f"Ошибка запуска VPN: {e}"
+        msg = f"Ошибка запуска VPN: {repr(e)}"
         print(msg)
         send_ntfy_alert(msg, title="VPN Error", priority="urgent", tags="warning")
         raise
@@ -258,7 +282,7 @@ def sync_kis_eris(days: int) -> bool:
         client_target_del.close()
         client_target_del = None
     except Exception as e:
-        msg = f"Ошибка очистки целевой ClickHouse: {e}"
+        msg = f"Ошибка очистки целевой ClickHouse: {repr(e)}"
         print(msg)
         send_ntfy_alert(msg[:120], title="kis_eris Clean Error", priority="urgent", tags="database")
         if client_target_del:
@@ -319,10 +343,11 @@ def sync_kis_eris(days: int) -> bool:
         cursor.executemany(f"INSERT INTO temp_kis_eris VALUES ({placeholders});", raw_rows)
         conn.commit()
         conn.close()
+        del raw_rows, result
         print("SQLite буфер заполнен.")
 
     except Exception as e:
-        msg = f"Ошибка source CH / SQLite: {e}"
+        msg = f"Ошибка source CH / SQLite: {repr(e)}"
         print(msg)
         send_ntfy_alert(msg[:120], title="kis_eris Error", priority="urgent", tags="fire")
         if client_source:
@@ -350,11 +375,12 @@ def sync_kis_eris(days: int) -> bool:
                 host=CH_HOST_TARGET, port=CH_PORT_TARGET,
                 username=CH_USER_TARGET, password=CH_PASSWORD_TARGET,
                 database=CH_DATABASE_TARGET, secure=True, verify=False,
+                send_receive_timeout=600, connect_timeout=30,
             )
             break
         except Exception as e:
-            print(f"Попытка {attempt}: {e}")
-            send_ntfy_alert(f"Ошибка подключения к target CH: {str(e)[:60]}",
+            print(f"Попытка {attempt}: {repr(e)}")
+            send_ntfy_alert(f"Ошибка подключения к target CH: {repr(e)[:60]}",
                             title="kis_eris Connect Error", priority="urgent", tags="database")
             if attempt < 3:
                 time.sleep(5)
@@ -365,19 +391,10 @@ def sync_kis_eris(days: int) -> bool:
                 return False
 
     try:
-        conn   = sqlite3.connect(_BUFFER_PATH)
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM temp_kis_eris;")
-        sqlite_rows = cursor.fetchall()
-        conn.close()
-        print(f"Прочитано {len(sqlite_rows)} строк из SQLite.")
+        print(f"Загружаю строки в {CH_DATABASE_TARGET}.{_TABLE_NAME} батчами по {_INSERT_BATCH_SIZE}...")
+        total_inserted = _stream_insert_from_sqlite(client_target, _TABLE_NAME, _BUFFER_PATH, _COLUMNS)
 
-        processed_rows = _process_rows(sqlite_rows)
-
-        print(f"Загружаю {len(processed_rows)} строк в {CH_DATABASE_TARGET}.{_TABLE_NAME}...")
-        client_target.insert(_TABLE_NAME, processed_rows, column_names=_COLUMNS)
-
-        msg = f"[kis_eris] Синхронизировано {len(processed_rows)} строк за {days} дней."
+        msg = f"[kis_eris] Синхронизировано {total_inserted} строк за {days} дней."
         print(msg)
         send_ntfy_alert(msg, title="kis_eris Success", priority="high", tags="white_check_mark")
 
@@ -393,8 +410,9 @@ def sync_kis_eris(days: int) -> bool:
         return True
 
     except Exception as e:
-        msg = f"Ошибка выгрузки в целевую ClickHouse: {e}"
+        msg = f"Ошибка выгрузки в целевую ClickHouse: {repr(e)}"
         print(msg)
+        print(traceback.format_exc())
         send_ntfy_alert(msg[:120], title="kis_eris Insert Error", priority="urgent", tags="database")
         if client_target:
             client_target.close()
@@ -460,7 +478,7 @@ def extract_phase() -> bool:
         return True
 
     except Exception as e:
-        msg = f"[kis_eris] Ошибка extract_phase: {e}"
+        msg = f"[kis_eris] Ошибка extract_phase: {repr(e)}"
         print(msg)
         send_ntfy_alert(msg[:120], title="kis_eris Extract Error", priority="urgent", tags="fire")
         if client_source:
@@ -490,10 +508,11 @@ def load_phase() -> bool:
                 host=CH_HOST_TARGET, port=CH_PORT_TARGET,
                 username=CH_USER_TARGET, password=CH_PASSWORD_TARGET,
                 database=CH_DATABASE_TARGET, secure=True, verify=False,
+                send_receive_timeout=600, connect_timeout=30,
             )
             break
         except Exception as e:
-            print(f"[kis_eris] Попытка {attempt}: {e}")
+            print(f"[kis_eris] Попытка {attempt}: {repr(e)}")
             if attempt < 3:
                 time.sleep(5)
             else:
@@ -509,26 +528,17 @@ def load_phase() -> bool:
         client_target.command(delete_query)
         print("[kis_eris] Старые данные удалены.")
 
-        conn   = sqlite3.connect(_BUFFER_PATH)
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM temp_kis_eris;")
-        sqlite_rows = cursor.fetchall()
-        conn.close()
-        print(f"[kis_eris] Прочитано {len(sqlite_rows)} строк из SQLite.")
+        print(f"[kis_eris] Загружаю строки в {CH_DATABASE_TARGET}.{_TABLE_NAME} батчами по {_INSERT_BATCH_SIZE}...")
+        total_inserted = _stream_insert_from_sqlite(client_target, _TABLE_NAME, _BUFFER_PATH, _COLUMNS)
 
-        processed_rows = _process_rows(sqlite_rows)
-
-        if not processed_rows:
+        if total_inserted == 0:
             print(f"[kis_eris] load_phase: 0 строк — нет данных за {DAYS_TO_SYNC} дней, только очистка.")
             client_target.close()
             try: os.remove(_BUFFER_PATH)
             except Exception: pass
             return True
 
-        print(f"[kis_eris] Загружаю {len(processed_rows)} строк в {CH_DATABASE_TARGET}.{_TABLE_NAME}...")
-        client_target.insert(_TABLE_NAME, processed_rows, column_names=_COLUMNS)
-
-        msg = f"[kis_eris] Синхронизировано {len(processed_rows)} строк за {DAYS_TO_SYNC} дней."
+        msg = f"[kis_eris] Синхронизировано {total_inserted} строк за {DAYS_TO_SYNC} дней."
         print(msg)
         send_ntfy_alert(msg, title="kis_eris Success", priority="high", tags="white_check_mark")
 
@@ -544,8 +554,9 @@ def load_phase() -> bool:
         return True
 
     except Exception as e:
-        msg = f"[kis_eris] Ошибка load_phase: {e}"
+        msg = f"[kis_eris] Ошибка load_phase: {repr(e)}"
         print(msg)
+        print(traceback.format_exc())
         send_ntfy_alert(msg[:120], title="kis_eris Load Error", priority="urgent", tags="database")
         if client_target:
             client_target.close()
