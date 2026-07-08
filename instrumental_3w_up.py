@@ -1,10 +1,11 @@
 """
 instrumental_3w_up.py
-Синхронизация инструментальных исследований за последние 7 дней
+Синхронизация инструментальных исследований с 01.01.2026
 из исходной ClickHouse в целевую через SQLite-буфер.
-При каждом запуске: TRUNCATE + полная перезагрузка.
+При каждом запуске: TRUNCATE + полная перезагрузка. Ретенция в target CH: 3 дня по load_datetime.
 Исключение: пары (ae_title, research_id) замеченные в v_route_eris_trauma за 14 дней;
 процедуры-исключения (33, 427, 34) проходят с любого аппарата.
+Также из итоговой выборки исключаются is_trauma_exam='Травма' и undescr_action='DEL_ASSIGNMENT'.
 
 # INPUT:  data_views.v_instrumental_examinations  (source CH, через VPN)
 #         data_views.v_route_eris_trauma           (source CH, через VPN)
@@ -67,7 +68,7 @@ _SQLITE_TMP  = 'temp_instrumental_3w'
 
 # Мониторинг актуальности данных
 MONITORING_TABLE       = 'dwh_test_db.dashboard_data_health'
-MONITORING_DASHBOARD   = 'Инструментальные исследования 7д'
+MONITORING_DASHBOARD   = 'Инструментальные исследования с 01.01.2026'
 MIN_SAFE_DATETIME      = datetime(1971, 1, 1, 0, 0, 0)
 MAX_SAFE_DATETIME      = datetime(2099, 12, 31, 23, 59, 59)
 MIN_SAFE_DATE          = date(1971, 1, 1)
@@ -186,9 +187,10 @@ _COLUMNS = [
     'is_trauma_exam',        # 'Травма' если accession_number есть в v_route_eris_trauma
     'undescr_status',        # status из dwh_views.v_undescribed_researches
     'undescr_reading_type',  # reading_type_code
-    'undescr_action',        # action (DEL_ASSIGN и др.)
+    'undescr_action',        # action (DEL_ASSIGNMENT и др.)
     'undescr_cito',          # признак CITO
     'task_list_fio',         # ФИО врача, у кого последним исследование было "в работе"
+    'llo_benefit_status',    # BENEFIT_SHORT_NAME из v_llo_benefit_patient, актуальный на conduct_date
     'meta_load_date',        # дата загрузки записи в ЛИ (DateTime64(9)) из источника
     'load_datetime',
 ]
@@ -341,6 +343,7 @@ def _ensure_table_exists(client) -> None:
             undescr_action                      Nullable(String),
             undescr_cito                        Nullable(String),
             task_list_fio                       Nullable(String),
+            llo_benefit_status                  Nullable(String),
             meta_load_date                      Nullable(DateTime64(9)),
             load_datetime                       DateTime
         )
@@ -362,6 +365,7 @@ def _ensure_table_exists(client) -> None:
         'undescr_action':       'Nullable(String)',
         'undescr_cito':         'Nullable(String)',
         'task_list_fio':        'Nullable(String)',
+        'llo_benefit_status':   'Nullable(String)',
         'meta_load_date':       'Nullable(DateTime64(9))',
         'load_datetime':        'DateTime DEFAULT now()',
     }
@@ -477,7 +481,7 @@ def _build_etl_events_query() -> str:
 
 def _build_query() -> str:
     # ВАЖНО: порядок колонок в SELECT совпадает с _COLUMNS
-    return f"""
+    inner_query = f"""
 WITH
 eris_described AS (
     -- Берём последнее описание по каждому исследованию (один accession → один врач)
@@ -516,14 +520,14 @@ trauma_exam AS (
     WHERE accession_number IS NOT NULL
 ),
 undescribed_status AS (
-    -- Последний статус из v_undescribed_researches: приоритет DEL_ASSIGN, потом свежее
+    -- Последний статус из v_undescribed_researches: приоритет DEL_ASSIGNMENT, потом свежее
     SELECT accession_number, status, reading_type_code, action, cito
     FROM (
         SELECT accession_number, status, reading_type_code, action, cito,
                ROW_NUMBER() OVER (
                    PARTITION BY accession_number
                    ORDER BY
-                       CASE WHEN action = 'DEL_ASSIGN' THEN 0 ELSE 1 END,
+                       CASE WHEN action = 'DEL_ASSIGNMENT' THEN 0 ELSE 1 END,
                        create_date DESC
                ) AS rn
         FROM dwh_views.v_undescribed_researches
@@ -584,6 +588,21 @@ latest_task_with_fio AS (
     SELECT lta.accession_number, grm.fio AS task_list_fio
     FROM latest_task_per_accession lta
     LEFT JOIN grouped_res_med_rab grm ON lta.job_execution_id = grm.doctor_id
+),
+llo_status AS (
+    -- Статусы льготного лекарственного обеспечения (940/941), активные записи (PATIENT_STATUS_ID=11, STATUS_LLO_ID=4)
+    SELECT `PATIENT_ID`, `START_DATE`, `END_DATE`, `BENEFIT_SHORT_NAME`
+    FROM data_views.v_llo_benefit_patient
+    WHERE BENEFIT_CODE in ('940', '941') and `PATIENT_STATUS_ID` = '11' and STATUS_LLO_ID in ('4')
+    GROUP BY 1,2,3,4
+),
+llo_periods AS (
+    -- Периоды действия статуса на пациента сворачиваем в массив (join по patient_id остаётся 1:1, без размножения строк);
+    -- диапазон START_DATE..END_DATE проверяется позже в SELECT относительно conduct_date
+    SELECT PATIENT_ID,
+           groupArray(tuple(START_DATE, coalesce(END_DATE, toDate('2099-12-31')), BENEFIT_SHORT_NAME)) AS periods
+    FROM llo_status
+    GROUP BY PATIENT_ID
 )
 SELECT
     e.assignment_conduct_id,
@@ -643,8 +662,16 @@ SELECT
     us.reading_type_code AS undescr_reading_type,
     us.action            AS undescr_action,
     us.cito              AS undescr_cito,
-    ltwf.task_list_fio   AS task_list_fio
+    ltwf.task_list_fio   AS task_list_fio,
+    if(
+        length(arrayFilter(x -> toDate(e.conduct_date) >= x.1 AND toDate(e.conduct_date) <= x.2, llop.periods)) = 0,
+        NULL,
+        arraySort(x -> (-toInt32(x.1), x.3),
+            arrayFilter(x -> toDate(e.conduct_date) >= x.1 AND toDate(e.conduct_date) <= x.2, llop.periods)
+        )[1].3
+    ) AS llo_benefit_status
 FROM data_views.v_instrumental_examinations AS e
+LEFT JOIN llo_periods            AS llop ON e.patient_id = llop.PATIENT_ID
 LEFT JOIN eris_described        AS ear  ON e.accession_number = ear.accession_number
 LEFT JOIN active_pin            AS ap   ON e.accession_number = ap.accession_number
 LEFT JOIN last_pin              AS lp   ON e.accession_number = lp.accession_number
@@ -652,7 +679,7 @@ LEFT JOIN trauma_exam           AS tex  ON e.accession_number = tex.accession_nu
 LEFT JOIN undescribed_status    AS us   ON e.accession_number = us.accession_number
 LEFT JOIN latest_task_with_fio  AS ltwf ON e.accession_number = ltwf.accession_number
 WHERE
-    toDate(e.conduct_date) >= today() - 7
+    toDate(e.conduct_date) >= '2026-01-01'
     AND e.ae_title            IS NOT NULL
     AND e.accession_number    IS NOT NULL
     AND e.assignment_status  != 'Выполнено'
@@ -670,7 +697,16 @@ WHERE
     )
 -- Защита от дублей: если один accession_number встречается несколько раз — берём первое по дате
 QUALIFY ROW_NUMBER() OVER (PARTITION BY e.accession_number ORDER BY e.conduct_date ASC) = 1
-ORDER BY e.conduct_date DESC, e.conduct_mo_name ASC
+"""
+    # Финальная обёртка: убираем травму и снятые с описания (DEL_ASSIGNMENT) назначения
+    # из итоговой выгрузки, не трогая внутреннюю логику дедупликации/джойнов выше.
+    return f"""
+SELECT * FROM (
+{inner_query}
+)
+WHERE is_trauma_exam != 'Травма'
+  AND (undescr_action IS NULL OR undescr_action != 'DEL_ASSIGNMENT')
+ORDER BY conduct_date DESC, conduct_mo_name ASC
 """
 
 
@@ -860,7 +896,7 @@ def _insert_etl_events(client_target) -> None:
 
 def export_instrumental_3w() -> bool:
     """Полный цикл: TRUNCATE → VPN → source CH → SQLite → VPN off → target CH."""
-    _rlog("📊 [instrumental_3w] Загрузка за последние 7 дней (полная перезагрузка)...")
+    _rlog("📊 [instrumental_3w] Загрузка с 01.01.2026 (полная перезагрузка)...")
     send_ntfy_alert(
         "Начинаю синхронизацию instrumental_examinations_3w...",
         title="Instrumental 3W Start", priority="default", tags="inbox",
@@ -878,9 +914,9 @@ def export_instrumental_3w() -> bool:
         )
         _ensure_table_exists(client_target_del)
         client_target_del.command(
-            f"ALTER TABLE {_TABLE_NAME} DELETE WHERE load_datetime < now() - interval 5 day"
+            f"ALTER TABLE {_TABLE_NAME} DELETE WHERE load_datetime < now() - interval 3 day"
         )
-        _rlog(f"✅ Загрузки старше 5 дней удалены из {_TABLE_NAME}.")
+        _rlog(f"✅ Загрузки старше 3 дней удалены из {_TABLE_NAME}.")
         client_target_del.close()
         client_target_del = None
     except Exception as e:
@@ -960,7 +996,7 @@ def export_instrumental_3w() -> bool:
         client_source = None
 
         if not raw_rows:
-            _rlog("📭 Нет данных за последние 7 дней.")
+            _rlog("📭 Нет данных с 01.01.2026.")
             send_ntfy_alert("Нет данных instrumental_3w", title="Instrumental 3W Empty",
                             priority="default", tags="inbox")
             disconnect_vpn()
@@ -1231,13 +1267,13 @@ def load_phase() -> bool:
 
     try:
         _ensure_table_exists(client_target)
-        print(f"🧹 Удаляю загрузки старше 5 дней из {_TABLE_NAME}")
+        print(f"🧹 Удаляю загрузки старше 3 дней из {_TABLE_NAME}")
         client_target.command(
-            f"ALTER TABLE {_TABLE_NAME} DELETE WHERE load_datetime < now() - interval 5 day"
+            f"ALTER TABLE {_TABLE_NAME} DELETE WHERE load_datetime < now() - interval 3 day"
         )
 
         if not _buffer_rows_3w:
-            print("📭 [instrumental_3w] load_phase: 0 строк в буфере, нет данных за 7 дней.")
+            print("📭 [instrumental_3w] load_phase: 0 строк в буфере, нет данных с 01.01.2026.")
             if os.path.exists(_ETL_EVENTS_BUFFER):
                 try:
                     _insert_etl_events(client_target)
@@ -1309,7 +1345,7 @@ def main():
     print(f"📝 Лог: {_log_path}")
     # ---
 
-    _rlog("🚀 Запуск instrumental_3w (7 дней, полная перезагрузка)")
+    _rlog("🚀 Запуск instrumental_3w (с 01.01.2026, полная перезагрузка)")
     send_ntfy_alert("Запускаю instrumental_3w...", title="Instrumental 3W Start",
                     priority="default", tags="robot")
     success = export_instrumental_3w()

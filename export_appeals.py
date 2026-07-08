@@ -100,6 +100,7 @@ FIELDS_PG_MAP: dict[str, str] = {
     "ufCrm65_1764337763490":     'ispravilos_li_dlya_grazhdanina',
     "ufCrm65_1764337796911":     'tonalnost_obrashcheniya',
     "ufCrm65_1764337864":        'kto_otpravil_otvet',
+    "ufCrm65_1782462188215":     'svo',
 }
 
 # Фиксированный список колонок в нужном порядке
@@ -138,6 +139,7 @@ SELECTED_FIELDS: list[str] = [
     "ufCrm65_1764337763490",       # Исправилось ли для гражданина
     "ufCrm65_1764337796911",       # Тональность обращения
     "ufCrm65_1764337864",          # Кто отправил ответ
+    "ufCrm65_1782462188215",       # Признак СВО
 ]
 
 logging.basicConfig(

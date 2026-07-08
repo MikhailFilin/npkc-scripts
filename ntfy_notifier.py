@@ -14,6 +14,11 @@ from typing import Optional
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import personal_config as cfg
 
+# Неинтерактивный запуск (фон, планировщик) даёт stdout в cp1251 — print() с эмодзи
+# роняет UnicodeEncodeError весь вызывающий скрипт. Переключаем поток на UTF-8.
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+
 # ================= НАСТРОЙКИ =================
 NTFY_SERVER      = getattr(cfg, 'NTFY_SERVER', 'https://ntfy.sh')
 NTFY_TOPIC       = cfg.NTFY_TOPIC
@@ -28,7 +33,7 @@ ENABLED = True
 # 🔕 Топики, в которые НЕ отправлять уведомления (для отладки/тишины)
 # Добавьте сюда названия топиков, которые нужно "заглушить"
 # Пример: SILENT_TOPICS = ["my_caop_bot_alerts_2026", "test_topic"]
-SILENT_TOPICS = ["my_caop_bot_alerts_2026"]
+SILENT_TOPICS = []
 # =============================================
 
 

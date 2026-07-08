@@ -106,8 +106,6 @@ _DASHBOARD_URLS = {
          'https://datalens.ru/izpccvuv9vrk2-medicina-kontrol-otlozhennyh-issledovaniy'),
     'guide_dismissed / guide_doctors_dismissal_v2':
         ('—', ''),
-    'appeals / feedback_2026':
-        ('—', ''),
 }
 
 
@@ -231,6 +229,10 @@ DAYS_ОКО_САУРОНА      = 20   # oko_saurona_up:        overdue_studies_
 DAYS_АИ_ЮЗИНГ         = 3    # ai_using_up:           ai_using_studies (Target CH)
                               #   ReplacingMergeTree: вставляет поверх, дубли схлопываются (Target CH)
                               #   удаляет и перегружает данные за последние N дней
+
+DAYS_АИ_МОДЕЛИ        = 3    # ai_model_usage_up:     ai_model_usage_daily (Target CH)
+                              #   частота использования моделей ИИ по модальностям
+                              #   дубли по (modality, date, model_id, procedure_name, access_method) схлопываются
 
 # Примечания:
 #   расхождение_ии_up   (ai_norma_comparing, PG):  фиксированная дата '2025-10-01' в исходном скрипте
@@ -455,8 +457,8 @@ _modules_map = {
     'кис_врачи':      'кис_загрузка_врачей.py',
     'oko_saurona':    'oko_saurona_up.py',
     'ai_using':       'ai_using_up.py',
+    'ai_model_usage': 'ai_model_usage_up.py',
     'guide_dismissed':'guide_dismissed_up.py',
-    'appeals':        'export_appeals.py',
 }
 
 _mods = {}
@@ -487,6 +489,7 @@ if _mods['kis_eris']:   _mods['kis_eris'].DAYS_TO_SYNC   = DAYS_КИС_ЕРИС
 if _mods['кис_врачи']:    _mods['кис_врачи'].DAYS_TO_SYNC    = DAYS_КИС_ВРАЧИ
 if _mods['oko_saurona']: _mods['oko_saurona'].DAYS_TO_SYNC = DAYS_ОКО_САУРОНА
 if _mods['ai_using']:    _mods['ai_using'].DAYS_TO_SYNC    = DAYS_АИ_ЮЗИНГ
+if _mods['ai_model_usage']: _mods['ai_model_usage'].DAYS_TO_SYNC = DAYS_АИ_МОДЕЛИ
 
 print("📦 Все модули загружены.\n")
 
@@ -638,6 +641,10 @@ def main():
         extract_results['ai_using / ai_using_studies'] = \
             _run_task("ai_using [extract]", lambda: m['ai_using'].extract_phase())
 
+    if m['ai_model_usage']:
+        extract_results['ai_model_usage / ai_model_usage_daily'] = \
+            _run_task("ai_model_usage [extract]", lambda: m['ai_model_usage'].extract_phase())
+
     # -----------------------------------------------------------------------
     # Отключение VPN
     # -----------------------------------------------------------------------
@@ -733,18 +740,20 @@ def main():
     if m['ai_using'] and extract_results.get('ai_using / ai_using_studies'):
         load_results['ai_using / ai_using_studies'] = \
             _run_task("ai_using [load]", lambda: m['ai_using'].load_phase())
+        # страховочная проверка дублей study_uid — всегда, независимо от результата load
+        _run_task("ai_using [dedup_check]", lambda: m['ai_using'].dedup_check())
+
+    if m['ai_model_usage'] and extract_results.get('ai_model_usage / ai_model_usage_daily'):
+        load_results['ai_model_usage / ai_model_usage_daily'] = \
+            _run_task("ai_model_usage [load]", lambda: m['ai_model_usage'].load_phase())
+        # страховочная проверка дублей ключа — всегда, независимо от результата load
+        _run_task("ai_model_usage [dedup_check]", lambda: m['ai_model_usage'].dedup_check())
 
     if m['guide_dismissed']:
         # Не требует VPN (Bitrix24 API + target CH) — выполняется целиком здесь
         ok = _run_task("guide_dismissed", lambda: _call_guide_dismissed(m['guide_dismissed']))
         extract_results['guide_dismissed / guide_doctors_dismissal_v2'] = True
         load_results['guide_dismissed / guide_doctors_dismissal_v2'] = ok
-
-    if m['appeals']:
-        # Не требует VPN (Bitrix24 API публичен, PostgreSQL в Yandex Cloud без VPN)
-        ok = _run_task("appeals [export → PG]", lambda: m['appeals'].main())
-        extract_results['appeals / feedback_2026'] = True
-        load_results['appeals / feedback_2026'] = ok
 
     # -----------------------------------------------------------------------
     # Итог

@@ -20,7 +20,7 @@ from datetime import datetime, timedelta
 import datetime as datetime_module
 
 from ntfy_notifier import send_ntfy_alert
-import personal_config2 as cfg
+import personal_config as cfg
 
 # === Битрикс24 ===
 BITRIX_WEBHOOK     = cfg.BITRIX_WEBHOOK
@@ -78,7 +78,7 @@ _SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 _BUFFER_PATH = os.path.join(_SCRIPTS_DIR, 'temp_buffer_ari_kis.db')
 
 _COLUMNS = [
-    'accession_number', 'study_uid', 'naz_code', 'naz_name', 'device_type', 'facility_id',
+    'accession_number', 'study_uid', 'naz_code', 'naz_name', 'device_type', 'ae_title', 'facility_id',
     'time_created', 'emias_id', 'sign_date', 'sign_datetime',
     'patient_id', 'pay_type_name', 'protocol_id',
     'sign_emp_id', 'sign_emp_fio', 'sign_emp_fio_short',
@@ -166,6 +166,7 @@ def _ensure_table_exists(client) -> None:
             naz_code                        String,
             naz_name                        String,
             device_type                     String,
+            ae_title                        String,
             facility_id                     String,
             time_created                    DateTime,
             emias_id                        String,
@@ -193,6 +194,7 @@ def _ensure_table_exists(client) -> None:
         ORDER BY (sign_date, accession_number)
         SETTINGS index_granularity = 8192;
     """)
+    client.command(f"ALTER TABLE {_TABLE_NAME} ADD COLUMN IF NOT EXISTS ae_title String")
     print(f"Таблица {_TABLE_NAME} проверена/создана.")
 
 
@@ -260,6 +262,7 @@ SELECT
     e.naz_code                                            AS naz_code,
     e.naz_name                                            AS naz_name,
     e.device_type                                         AS device_type,
+    e.ae_title                                            AS ae_title,
     e.facility_id                                         AS facility_id,
     i.time_created                                        AS time_created,
     i.emias_id                                            AS emias_id,
@@ -348,7 +351,7 @@ def _process_rows(raw_rows: list) -> list:
     result = []
     for row in raw_rows:
         (
-            accession_number, study_uid, naz_code, naz_name, device_type, facility_id,
+            accession_number, study_uid, naz_code, naz_name, device_type, ae_title, facility_id,
             time_created, emias_id, sign_date, sign_datetime,
             patient_id, pay_type_name, protocol_id,
             sign_emp_id, sign_emp_fio, sign_emp_fio_short,
@@ -389,7 +392,7 @@ def _process_rows(raw_rows: list) -> list:
 
         result.append([
             s(accession_number), s(study_uid), s(naz_code), s(naz_name),
-            s(device_type), s(facility_id),
+            s(device_type), s(ae_title), s(facility_id),
             tc, s(emias_id), d, sd_dt,
             s(patient_id), s(pay_type_name), s(protocol_id),
             s(sign_emp_id), s(sign_emp_fio), s(sign_emp_fio_short),
@@ -477,6 +480,7 @@ def sync_ari_kis(days: int) -> bool:
                 naz_code                        TEXT,
                 naz_name                        TEXT,
                 device_type                     TEXT,
+                ae_title                        TEXT,
                 facility_id                     TEXT,
                 time_created                    TEXT,
                 emias_id                        TEXT,

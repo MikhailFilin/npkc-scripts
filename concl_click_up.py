@@ -36,7 +36,7 @@ CH_PASSWORD_SOURCE = cfg.CH_PASSWORD
 CH_DATABASE_SOURCE = cfg.CH_DATABASE
 
 # === Настройки синхронизации (плавающие даты) ===
-DAYS_TO_SYNC = 100
+DAYS_TO_SYNC = 5
 
 _SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 _BUFFER_CONCL = os.path.join(

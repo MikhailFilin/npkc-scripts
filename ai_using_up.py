@@ -12,6 +12,7 @@ ai_using_up.py  →  dwh_test_db.ai_using_studies  (Target CH)
 import sys
 import subprocess
 import time
+import traceback
 import numpy as np
 import pandas as pd
 import pyautogui
@@ -122,7 +123,7 @@ def _target_client():
         host=cfg.CH_HOST_TARGET, port=cfg.CH_PORT_TARGET,
         username=cfg.CH_USER_TARGET, password=cfg.CH_PASSWORD_TARGET,
         secure=True, verify=False,
-        connect_timeout=15, send_receive_timeout=120,
+        connect_timeout=15, send_receive_timeout=600,
     )
 
 
@@ -148,7 +149,9 @@ def _analyse_one(client, date_from: str, date_to: str, modality: str) -> pd.Data
             FROM data_views.v_eris_assignment_results
             WHERE assignment_describe_mu_id = '{MU_ID}'
               AND device_type = '{device_type}'
-              AND toDate(assignment_describe_start_date) BETWEEN '{date_from}' AND '{date_to}'
+              -- период фильтруется по дате подписания заключения (как в concl_npkc_up.py),
+              -- а не по дате начала описания — иначе популяция исследований расходится
+              AND toDate(assignment_result_doc_created_date) BETWEEN '{date_from}' AND '{date_to}'
             GROUP BY study_uid
         ),
         ai_result AS (
@@ -393,6 +396,64 @@ def _prepare(df: pd.DataFrame, date_from: str, date_to: str) -> pd.DataFrame:
     return upload
 
 
+def _dedup_mutation(tc):
+    """ALTER TABLE ... DELETE — оставляет по каждому study_uid только
+    самую свежую версию (по loaded_at). Кидает исключение при ошибке."""
+    tc.command(
+        '''
+        ALTER TABLE dwh_test_db.ai_using_studies
+        DELETE WHERE (study_uid, loaded_at) NOT IN (
+            SELECT study_uid, max(loaded_at)
+            FROM dwh_test_db.ai_using_studies
+            GROUP BY study_uid
+        )
+        ''',
+        settings={'mutations_sync': '1'},
+    )
+
+
+def dedup_check(verbose: bool = True) -> bool:
+    """Безопасная самостоятельная проверка/устранение дублей study_uid
+    в dwh_test_db.ai_using_studies. Не зависит от _buffer — можно вызывать
+    отдельно (в конце main() или из all_dashboards_up.py) как страховку
+    на случай, если дедуп внутри load_phase() не отработал."""
+    try:
+        tc = _target_client()
+        total = int(tc.query_df(
+            "SELECT count() AS cnt FROM dwh_test_db.ai_using_studies"
+        ).iloc[0, 0])
+        uniq = int(tc.query_df(
+            "SELECT count(DISTINCT study_uid) AS cnt FROM dwh_test_db.ai_using_studies"
+        ).iloc[0, 0])
+        dup = total - uniq
+
+        if dup <= 0:
+            if verbose:
+                print(f'[ai_using] dedup_check: дублей нет ({total} строк)')
+            return True
+
+        if verbose:
+            print(f'[ai_using] dedup_check: найдено {dup} дублей study_uid '
+                  f'({total} строк, {uniq} уникальных) — устраняю...')
+        _dedup_mutation(tc)
+
+        total_after = int(tc.query_df(
+            "SELECT count() AS cnt FROM dwh_test_db.ai_using_studies"
+        ).iloc[0, 0])
+        if verbose:
+            print(f'[ai_using] dedup_check: удалено {total - total_after} строк, '
+                  f'осталось {total_after}')
+        return True
+    except Exception as e:
+        print(f'[ai_using] ❌ dedup_check: {e}')
+        print(traceback.format_exc())
+        send_ntfy_alert(
+            f'ai_using dedup_check: ошибка — {e}',
+            title='AI Using Dedup Check Failed', priority='urgent', tags='warning',
+        )
+        return False
+
+
 def load_phase() -> bool:
     global _buffer
     if _buffer is None or len(_buffer) == 0:
@@ -407,26 +468,38 @@ def load_phase() -> bool:
         upload = _prepare(_buffer, date_from, date_to)
         tc = _target_client()
         tc.insert_df('dwh_test_db.ai_using_studies', upload)
-
-        # принудительная дедупликация по study_uid. ReplacingMergeTree схлопывает
-        # дубли только в рамках одного ORDER BY ключа (modality, toDate(describe_start),
-        # study_uid) — если у исследования между двумя синхронизациями сдвинулся
-        # describe_start (например, описание перезапустили на след. день), ключ
-        # меняется и OPTIMIZE FINAL дубль не убирает. Поэтому удаляем явно по study_uid,
-        # оставляя только самую свежую версию (по loaded_at).
-        print('[ai_using] дедупликация study_uid (ALTER TABLE ... DELETE)...')
-        tc.command(
-            '''
-            ALTER TABLE dwh_test_db.ai_using_studies
-            DELETE WHERE (study_uid, loaded_at) NOT IN (
-                SELECT study_uid, max(loaded_at)
-                FROM dwh_test_db.ai_using_studies
-                GROUP BY study_uid
-            )
-            ''',
-            settings={'mutations_sync': '1'},
+    except Exception as e:
+        print(f'[ai_using] ❌ load_phase (insert): {e}')
+        print(traceback.format_exc())
+        send_ntfy_alert(
+            f'ai_using load_phase: ошибка вставки — {e}',
+            title='AI Using Insert Failed', priority='urgent', tags='warning',
         )
+        return False
 
+    # принудительная дедупликация по study_uid. ReplacingMergeTree схлопывает
+    # дубли только в рамках одного ORDER BY ключа (modality, toDate(describe_start),
+    # study_uid) — если у исследования между двумя синхронизациями сдвинулся
+    # describe_start (например, описание перезапустили на след. день), ключ
+    # меняется и OPTIMIZE FINAL дубль не убирает. Поэтому удаляем явно по study_uid,
+    # оставляя только самую свежую версию (по loaded_at).
+    # Отдельный try — если дедуп упадёт (например, таймаут мутации), вставленные
+    # данные уже не теряем и не гоняем повторно, но явно сообщаем об ошибке.
+    print('[ai_using] дедупликация study_uid (ALTER TABLE ... DELETE)...')
+    try:
+        _dedup_mutation(tc)
+    except Exception as e:
+        print(f'[ai_using] ❌ дедупликация не выполнена: {e}')
+        print(traceback.format_exc())
+        send_ntfy_alert(
+            f'ai_using load_phase: дедупликация study_uid упала — {e}',
+            title='AI Using Dedup Failed', priority='urgent', tags='warning',
+        )
+        # вставка прошла успешно — буфер очищаем, дубли почистятся при следующем запуске
+        _buffer = None
+        return True
+
+    try:
         cnt = tc.query_df(
             f"SELECT count() AS cnt FROM dwh_test_db.ai_using_studies "
             f"WHERE period_from = '{date_from}' AND period_to = '{date_to}'"
@@ -435,11 +508,12 @@ def load_phase() -> bool:
             "SELECT count() AS cnt FROM dwh_test_db.ai_using_studies"
         )
         print(f'[ai_using] ✅ загружено за период: {cnt.iloc[0,0]} | всего в таблице: {total_all.iloc[0,0]}')
-        _buffer = None
-        return True
     except Exception as e:
-        print(f'[ai_using] ❌ load_phase: {e}')
-        return False
+        print(f'[ai_using] ⚠️ не удалось получить итоговые счётчики: {e}')
+        print(traceback.format_exc())
+
+    _buffer = None
+    return True
 
 
 # ===========================================================================
@@ -478,6 +552,9 @@ def main():
 
     # Шаг 3: load → target CH
     ok = load_phase()
+
+    # Шаг 4: страховочная проверка дублей — всегда, независимо от ok
+    dedup_check()
 
     if ok:
         send_ntfy_alert(
