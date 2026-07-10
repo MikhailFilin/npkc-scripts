@@ -36,7 +36,7 @@ CH_PASSWORD_SOURCE = cfg.CH_PASSWORD
 CH_DATABASE_SOURCE = cfg.CH_DATABASE
 
 # === Настройки синхронизации (плавающие даты) ===
-DAYS_TO_SYNC = 20
+DAYS_TO_SYNC = 5
 
 _BUFFER_СТАДИ = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'temp_buffer.db')
 _СТАДИ_COLUMNS = ['conduct_date', 'assignment_mu_name', 'conduct_mo_name', 'conduct_mu_name',

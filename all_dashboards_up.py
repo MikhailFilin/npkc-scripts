@@ -21,7 +21,8 @@ VPN подключается ОДИН РАЗ, все запросы выполн
   15. vitrina_sync          → v_task_pin, v_undescribed + матвью (PostgreSQL)
   16. kis_eris_up           → kis_eris                         (Target CH)
   17. oko_saurona_up        → overdue_studies_monitoring        (Target CH)
-  18. guide_dismissed_up    → guide_doctors_dismissal_v2        (Target CH, без VPN)
+  18. svo_eris_llo_up       → svo_eris_llo_examinations         (Target CH)
+  19. guide_dismissed_up    → guide_doctors_dismissal_v2        (Target CH, без VPN)
 
 Исключён (старый скрипт):
   не_описанные_up.py          → instrumental_examinations_queue_v3  (заменён на instrumental_3w_up)
@@ -104,6 +105,8 @@ _DASHBOARD_URLS = {
     'oko_saurona / overdue_studies_monitoring':
         ('Медицина — Контроль отложенных исследований',
          'https://datalens.ru/izpccvuv9vrk2-medicina-kontrol-otlozhennyh-issledovaniy'),
+    'svo_eris_llo / svo_eris_llo_examinations':
+        ('—', ''),
     'guide_dismissed / guide_doctors_dismissal_v2':
         ('—', ''),
 }
@@ -225,6 +228,9 @@ DAYS_КИС_ВРАЧИ        = 30  # кис_загрузка_врачей:   ki
                               #   удаляет и перегружает данные за последние N дней
 
 DAYS_ОКО_САУРОНА      = 20   # oko_saurona_up:        overdue_studies_monitoring
+
+DAYS_SVO_ERIS_LLO     = 20   # svo_eris_llo_up:       svo_eris_llo_examinations
+                              #   удаляет и перегружает данные за последние N дней
 
 DAYS_АИ_ЮЗИНГ         = 3    # ai_using_up:           ai_using_studies (Target CH)
                               #   ReplacingMergeTree: вставляет поверх, дубли схлопываются (Target CH)
@@ -456,6 +462,7 @@ _modules_map = {
     'kis_eris':       'kis_eris_up.py',
     'кис_врачи':      'кис_загрузка_врачей.py',
     'oko_saurona':    'oko_saurona_up.py',
+    'svo_eris_llo':   'svo_eris_llo_up.py',
     'ai_using':       'ai_using_up.py',
     'ai_model_usage': 'ai_model_usage_up.py',
     'guide_dismissed':'guide_dismissed_up.py',

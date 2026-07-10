@@ -181,10 +181,14 @@ def _ensure_table_exists(client) -> None:
 
 
 def _build_query(n_days_ago: str) -> str:
+    # ВАЖНО: фильтр периода — по e2.run_dt (собственная дата исследования в kis.eris),
+    # а не по i.sign_dt. Раньше фильтр по i.sign_dt в WHERE после LEFT JOIN превращал
+    # его в INNER JOIN (NULL >= date -> NULL), из-за чего терялись все аппараты/строки
+    # без пары в kis.instrumental (ещё не "подписанные" исследования, в основном ангио/катлаб).
     return f"""
 SELECT
-    toDate(i.sign_dt)                        AS date_dt,
-    toDateTime64(i.sign_dt, 3, 'UTC')        AS date_time,
+    toDate(e2.run_dt)                        AS date_dt,
+    toDateTime64(e2.run_dt, 3, 'UTC')        AS date_time,
     e2.facility_id                           AS facility_id,
     f.short_name                             AS facility_short_name,
     e2.device_type                           AS device_type,
@@ -202,7 +206,7 @@ LEFT JOIN kis.instrumental i
 LEFT JOIN kis.facility f
     ON e2.facility_id = f.id
 WHERE e2.studyuid IS NOT NULL
-  AND i.sign_dt >= '{n_days_ago}'
+  AND e2.run_dt >= '{n_days_ago}'
 """
 
 
