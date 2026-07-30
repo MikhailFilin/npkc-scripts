@@ -1,0 +1,9 @@
+Pin/
+  ├── fetch_task_files.py   — мониторинг Битрикс, скачивает Excel → авто-запуск reshot_sync                                                                                  
+  ├── reshot_sync.py        — обновляет mrc_2.reshot_pin + REFRESH матвью
+  ├── vitrina_sync.py       — выгружает витрины ClickHouse → PostgreSQL (запуск утром)                                                                                       
+  ├── vtp.py / vur.py       — старые утилиты (больше не нужны, встроено в vitrina_sync)                                                                                    
+  └── downloads/            — скачанные Excel-файлы решот                                                                                                                    
+
+  Перед первым запуском нужно уточнить одно: точное имя столбца в mrc_2.reshot_pin — в reshot_sync.py используется RESHOT_COL = "accession_number". Проверь через SELECT
+  column_name FROM information_schema.columns WHERE table_schema='mrc_2' AND table_name='reshot_pin' и скорректируй константу если нужно.
